@@ -10,13 +10,13 @@ nSJ = int(evtsToGen/evtsPerJob)
 #beam parameters
 smear = 0
 paint = 0
-xoff = 50
+xoff = int(50)
 ecut = 10
 savestring = f'smear{smear}_paint{paint}_xoffset{xoff}'
 
 j = Job(name = f'run_fixedTarget_{savestring}-{evtsToGen}events')
 j.application = Executable(exe = File('bashScript.sh'),\
-                           args = [savestring, '-o', '"./"', '-n', evtsPerJob,'--no-debug -e', ecut, '--beam-smear=', smear, '--beam-paint=', paint, '--x-offset=', xoff])
+                           args = [savestring, '-o', '"./"', '-n', evtsPerJob,'--no-debug --no-force -e', ecut, '--beam-smear', smear, '--beam-paint', paint, '--x-offset', xoff])
 j.splitter = ArgSplitter(args = [['-r', startRun + _i] for _i in range(nSJ)], append = True)
 j.outputfiles = [] #LocalFile('*.root')]
 j.backend = Condor()

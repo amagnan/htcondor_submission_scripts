@@ -46,5 +46,5 @@ else
     fi
 fi
 
-echo "INFO: Files copied to eos!"
-ls -ltrh $EOSDIR/*
+echo "INFO: Files copied to eos dir $EOSDIR! List: "
+ls -ltrh $EOSDIR/
