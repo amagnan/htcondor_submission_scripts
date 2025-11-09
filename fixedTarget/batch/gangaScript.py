@@ -3,8 +3,8 @@ import os
 import random
 random.seed(os.environ.get("USER"))
 startRun = 0 # int(time.time()) + random.randint(0,10000)
-evtsPerJob = 50000
-evtsToGen = 10000000
+evtsPerJob = 10000
+evtsToGen = 2000000
 nSJ = int(evtsToGen/evtsPerJob)
 
 #beam parameters
@@ -13,7 +13,7 @@ paint = 0
 xoff = 50
 sigma = 8
 ecut = 10
-prod = 251107
+prod = 251109
 
 for nS in range(11):
 #for nS in range(2):
