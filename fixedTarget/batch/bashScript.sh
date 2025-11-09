@@ -3,14 +3,17 @@
 LOCALDIR=`pwd`
 FS_INSTALL=/afs/cern.ch/user/a/ammagnan
 
-#access string to save output files
+#access strings to save output files
 savestring=$1
+# Remove the first argument
+shift
 
+prod=$1
 # Remove the first argument
 shift
 
 export EOS_MGM_URL=root://eospublic.cern.ch
-EOSDIR=/eos/experiment/ship/user/ammagnan/TargetProd/251106/$savestring 
+EOSDIR=/eos/experiment/ship/user/ammagnan/TargetProd/$prod/$savestring 
 mkdir -p $EOSDIR
 
 echo "INFO: eos dir set to "$EOSDIR
