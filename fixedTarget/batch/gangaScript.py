@@ -2,9 +2,9 @@ import time
 import os
 import random
 random.seed(os.environ.get("USER"))
-startRun = 0 # int(time.time()) + random.randint(0,10000)
-evtsPerJob = 10000
-evtsToGen = 2000000
+startRun = 200 # int(time.time()) + random.randint(0,10000)
+evtsPerJob = 25000
+evtsToGen = 5000000
 nSJ = int(evtsToGen/evtsPerJob)
 
 #beam parameters
@@ -13,7 +13,7 @@ paint = 0
 xoff = 50
 sigma = 8
 ecut = 10
-prod = 251109
+prod = 251117
 
 for nS in range(11):
 #for nS in range(2):
@@ -23,7 +23,7 @@ for nS in range(11):
 
     j = Job(name = f'run_fixedTarget_{savestring}-{evtsToGen}events')
     j.application = Executable(exe = File('bashScript.sh'),\
-                               args = [savestring, prod, '-o', '"./"', '-n', evtsPerJob,'--no-debug --no-force -e', ecut, '--beam-smear', smear, '--beam-paint', paint, '--x-offset', myxoff])
+                               args = [savestring, prod, '-o', '"./"', '-n', evtsPerJob,'--no-debug --no-force --AddCylindricalSensPlane -e', ecut, '--beam-smear', smear, '--beam-paint', paint, '--x-offset', myxoff])
     j.splitter = ArgSplitter(args = [['-r', startRun + _i] for _i in range(nSJ)], append = True)
     j.outputfiles = [] #LocalFile('*.root')]
     j.backend = Condor()
