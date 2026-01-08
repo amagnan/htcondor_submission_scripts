@@ -17,20 +17,31 @@ EOSDIR=/eos/experiment/ship/user/ammagnan/TargetProd/$prod/$savestring
 mkdir -p $EOSDIR
 
 echo "INFO: eos dir set to "$EOSDIR
-#source /cvmfs/ship.cern.ch/25.09/setUp.sh
-source /cvmfs/ship-nightlies.cern.ch/pythia8.315/setUp.sh
+
+export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
+which aliBuild
+
+source /cvmfs/ship.cern.ch/25.12/setUp.sh
+#source /cvmfs/ship-nightlies.cern.ch/pythia8.315/setUp.sh
+export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
+which aliBuild
 
 export ALIBUILD_WORK_DIR=${FS_INSTALL}/sw
 
 source ${FS_INSTALL}/htcondor_submission_scripts/fixedTarget/batch/test_config.sh
 
 export ROOT_INCLUDE_PATH=$ROOT_INCLUDE_PATH:$FAIRSHIP/shipdata
+export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
 
+which aliBuild
+
+echo "ALIBUILD_INSTALL_ROOT set to: " $ALIBUILD_INSTALL_ROOT
 echo "INFO: Environment set up for FairShip located at " $FAIRSHIP
+echo "PYTHIA8DATA set to: " $PYTHIA8DATA
 
-echo "INFO: Executing: python ${FS_INSTALL}/FairShip/muonShieldOptimization/run_fixedTarget.py" $@
+echo "INFO: Executing: python ${FS_INSTALL}/FairShip/macro/run_fixedTarget.py" $@
 
-python ${FS_INSTALL}/FairShip/muonShieldOptimization/run_fixedTarget.py $@
+python ${FS_INSTALL}/FairShip/macro/run_fixedTarget.py $@
 
 echo "INFO: Finished running. These files are on the WN:"
 ls -lh *
