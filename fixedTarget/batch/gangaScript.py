@@ -3,29 +3,23 @@ import os
 import random
 random.seed(os.environ.get("USER"))
 startRun = 0 # int(time.time()) + random.randint(0,10000)
-evtsPerJob = 100000
-evtsToGen = 50000000
+evtsPerJob = 1000000
+evtsToGen = 500000000
 nSJ = int(evtsToGen/evtsPerJob)
 
 #beam parameters
-smear = 0
-paint = 0
-#xoff = 115
-#sigma = 5
-ecut = 1
-prod = 251212
+ecut = 20
+prod = 260327
 
-#for nS in range(11):
-#for nS in range(2):
-    #myxoff = xoff+nS*sigma
-for myxoff in [50,75,100,115,120,125,130,140,180,220]:
-#for myxoff in [50]:
-    savestring = f'smear{smear}_paint{paint}_yoffset{myxoff}'
+for target_config in ["","_allW","_thinW","_thinW_He20","_thinW_He200"]:
+#for target_config in ["_thinW"]:
+    savestring = f'target{target_config}'
     print(savestring)
+    yamlstring = f'/afs/cern.ch/user/a/ammagnan/workdir/test_target/target_config{target_config}.yaml'
 
     j = Job(name = f'run_fixedTarget_{savestring}-{evtsToGen}events')
     j.application = Executable(exe = File('bashScript.sh'),\
-                               args = [savestring, prod, '-o', '"./"', '-n', evtsPerJob,'--AddCylindricalSensPlane -e', ecut, '--beam-smear', smear, '--beam-paint', paint, '--y-offset', myxoff])
+                               args = [savestring, prod, '-o', '"./"', '-n', evtsPerJob,'--AddPostTargetSensPlane -e', ecut, '--TARGET_YAML', yamlstring])
     j.splitter = ArgSplitter(args = [['-r', startRun + _i] for _i in range(nSJ)], append = True)
     j.outputfiles = [] #LocalFile('*.root')]
     j.backend = Condor()

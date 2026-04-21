@@ -18,12 +18,12 @@ mkdir -p $EOSDIR
 
 echo "INFO: eos dir set to "$EOSDIR
 
-export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
-which aliBuild
+#export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
+#which aliBuild
 
-source /cvmfs/ship.cern.ch/25.12/setUp.sh
+source /cvmfs/ship.cern.ch/26.02/setUp.sh
 #source /cvmfs/ship-nightlies.cern.ch/pythia8.315/setUp.sh
-export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
+#export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
 which aliBuild
 
 export ALIBUILD_WORK_DIR=${FS_INSTALL}/sw
@@ -31,7 +31,7 @@ export ALIBUILD_WORK_DIR=${FS_INSTALL}/sw
 source ${FS_INSTALL}/htcondor_submission_scripts/fixedTarget/batch/test_config.sh
 
 export ROOT_INCLUDE_PATH=$ROOT_INCLUDE_PATH:$FAIRSHIP/shipdata
-export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
+#export PATH=/afs/cern.ch/user/a/ammagnan/.local/bin/:$PATH
 
 which aliBuild
 
