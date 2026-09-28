@@ -13,12 +13,16 @@ import tempfile
 def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         'Pass filterEvents.py options after -- (for example -- -g geometry.root). '
-        'Outputs are INPUT_filtered.root; filtered outputs and backups are skipped. '
+        'Outputs are INPUT_filtered_NUMBER.root; filtered outputs and backups are skipped. '
         'By default only preview jobs; use --submit to submit them.'))
     parser.add_argument('directory', type=Path)
     parser.add_argument('--fs-install', type=Path,
                         default=Path('/afs/cern.ch/work/a/ammagnan/FairShip'))
     parser.add_argument('--site', default='CERN')
+    parser.add_argument('--filter-option', type=int, choices=(0, 1, 2), default=1,
+                        help='0: charged hits at Tr1 (default); 1: two charged tracks at tracking '
+                             'and timing planes; 2: any daughter entering the Tr1-to-calorimeter '
+                             'volume. A --filter-option after -- overrides this value.')
     parser.add_argument('--max-runtime', type=int, default=86000)
     parser.add_argument('--ganga', default='/cvmfs/ganga.cern.ch/Ganga/install/ship/bin/ganga')
     parser.add_argument('--submit', action='store_true')
@@ -41,12 +45,18 @@ def main():
     auxiliary.add_argument('--field-map', '--field_map',default='/afs/cern.ch/work/a/ammagnan/FairShip/files/2026_05_07_MainSpectrometerField_V21_3000.root')
     auxiliary.add_argument('--muon-shield-field-map',default='/afs/cern.ch/work/a/ammagnan/FairShip/files/TRY_2025.root')
     auxiliary.add_argument('--no-detector-acceptance', action='store_true')
+    auxiliary.add_argument('--filter-option', type=int, choices=(0, 1, 2), default=args.filter_option)
+
     # Parse supplied values separately so disabled acceptance does not require
     # default geometry/maps, while explicit auxiliary options still pass through.
     defaults = {dest: auxiliary.get_default(dest)
                 for dest in ('geoFile', 'field_map', 'muon_shield_field_map')}
     auxiliary.set_defaults(geoFile=None, field_map=None, muon_shield_field_map=None)
     known, filter_args = auxiliary.parse_known_args(filter_args)
+    if known.no_detector_acceptance and known.filter_option != 0:
+        parser.error('Filter options 1 and 2 require detector acceptance')
+    filter_args.extend(['--pythia-decays'])
+    filter_args.extend(['--filter-option', str(known.filter_option)])
     if known.no_detector_acceptance:
         filter_args.append('--no-detector-acceptance')
     excluded = set()
@@ -74,11 +84,11 @@ def main():
     seen = set()
     for source in sorted(directory.rglob('*.root')):
         if (not source.is_file() or source.resolve() in excluded | seen
-                or source.stem.endswith('_filtered')
+                or re.search(r'_filtered(?:_\d+)?$', source.stem)
                 or re.search(r'_backup(?:_\d+)?$', source.stem)):
             continue
         seen.add(source.resolve())
-        destination = source.with_name(source.stem + '_filtered.root')
+        destination = source.with_name(f'{source.stem}_filtered_{known.filter_option}.root')
         jobs.append((str(source), str(destination)))
         print(f'{source} -> {destination}', flush=True)
         if args.test:
@@ -89,11 +99,12 @@ def main():
             ]
             filter_command = [
                 'python3', str(installation / 'newMuonDIS/filterEvents.py'),
-                '-f', str(source), '-o', str(destination), *filter_args,
+                '-f', str(source), '-o', str(Path('filter_output') / destination.name), *filter_args,
             ]
             print('Worker command to submit: ' + shlex.join(worker_command), flush=True)
             print('Filter command (inside the FairShip Pixi environment): '
                   + shlex.join(filter_command), flush=True)
+            print(f'After filtering, copy local filter_output/{destination.name} to {destination}', flush=True)
             break
     print(f'{len(jobs)} jobs {"to submit" if args.submit else "(preview; use --submit to submit)"}', flush=True)
     if not args.submit or not jobs:
@@ -102,8 +113,9 @@ def main():
     wrapper = str(Path(__file__).resolve().with_name('wn_script_pixi.py'))
     # Ganga supplies Job, Executable, File and Condor in its script namespace.
     script = f'''
-for source, destination in {jobs!r}:
-    j = Job(name='filter ' + source)
+for index, (source, destination) in enumerate({jobs!r}):
+    # Ganga uses the job name in worker filenames; avoid path separators.
+    j = Job(name='filter_' + str(index))
     j.application = Executable(exe=File({worker!r}), args=[
         {str(installation)!r}, {args.site!r}, source, destination] + {filter_args!r})
     j.inputfiles = [LocalFile({wrapper!r})]

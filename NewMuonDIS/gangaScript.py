@@ -9,13 +9,13 @@ SITE = 'CERN'  # or GENT or GRIDPP
 pathToFiles='/eos/experiment/ship/simulation/cuda_muons/try_2025/processed_muons/'
 tag='TRY2025'
 geofile='/eos/experiment/ship/simulation/cuda_muons/try_2025/processed_muons/geo_cuda_test.root'
-zmax = 9600 #maximum z position to create DIS events
-nDIS = 1000
+zmax = 9500 #maximum z position to create DIS events
+nDIS = 100
 debug=0
-prod=260805
+prod=260925
 outpath='/eos/experiment/ship/user/ammagnan/MuonDIS'
 nEvtsPerFile=500000
-nEvtsPerJob=10000
+nEvtsPerJob=50000
 
 # Set this path to wherever you want the output to go
 outdir=f'{outpath}/{tag}/{prod}/'
@@ -34,13 +34,13 @@ count = sum(
 )
 
 print(f"Found {count} files to process in {pathToFiles}")
-nJ = count
+nJ = 50 #count
 nSJ = nEvtsPerFile // nEvtsPerJob
 
 for therun in range(nJ):
 
     j = Job(name = f'run sim production number {tag} - run {therun} - {nSJ} subruns')
-    j.application = Executable(exe = File('wn_script_pixi.py'), args = ['--fs-install',FS_INSTALL,'--runfile', 'muonDIS/prepareEvents.py', '--site', SITE, '--', '-n', nEvtsPerJob, '-d', nDIS, '-g', geofile, '-z', zmax, '--debug', debug, '-f', f"{pathToFiles}/{therun}"])
+    j.application = Executable(exe = File('wn_script_pixi.py'), args = ['--fs-install',FS_INSTALL,'--runfile', 'newMuonDIS/prepareEvents.py', '--site', SITE, '--', '-n', nEvtsPerJob, '-d', nDIS, '-g', geofile, '-z', zmax, '--debug', debug, '-f', f"{pathToFiles}/{therun}"])
 
     #args that depend on subjobs
     print([['-s',f"{_i*nEvtsPerJob}",'-o', f"muonDis_cudaMu_{tag}_{therun}_evt{_i*nEvtsPerJob}_{(_i+1)*nEvtsPerJob}.root"] for _i in range(nSJ)])

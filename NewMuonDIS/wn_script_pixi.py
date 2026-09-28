@@ -29,7 +29,7 @@ def main():
     parser.add_argument(
         "--runfile",
         help="Which python file to run (taken from the FairShip dir location)",
-        default = "muonDIS/prepareEvents.py"
+        default = "newMuonDIS/prepareEvents.py"
     )
 
     # Everything after this is passed through to the FairShip script
