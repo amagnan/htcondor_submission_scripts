@@ -8,6 +8,8 @@ import shlex
 import subprocess
 import tempfile
 
+from generator_worker import output_tag
+
 
 # Edit production and detector configuration here, rather than on the command line.
 FS_INSTALL = Path('/afs/cern.ch/work/a/ammagnan/FairShip')
@@ -15,7 +17,7 @@ SITE = 'CERN'
 GANGA = '/cvmfs/ganga.cern.ch/Ganga/install/ship/bin/ganga'
 MAX_RUNTIME = 86000
 INPUT_PATTERN = '*_filtered_1.root'  # Recursive; use a prepared-file pattern if needed.
-OUTPUT_DIR = None  # EOS destination (Path('/eos/...')); None uses INPUT/generated.
+OUTPUT_DIR = None  # EOS destination (Path('/eos/...')); None uses PROD_DATE/generated.
 # Workers always generate in their local working directory before copying to OUTPUT_DIR.
 N_EVENTS = -1  # All stored DIS interactions in each file; --test limits this to 100.
 FIRST_EVENT = 0  # Input muon entry, not DIS interaction number.
@@ -35,16 +37,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         'Edit the defaults at the top of generatorScript.py. Preview only unless '
         '--submit is supplied. Input and output paths must be accessible on workers.'))
-    parser.add_argument('directory', type=Path)
+    parser.add_argument('directory', type=Path,
+                        help='Scan inputs with layout PROD_DATE/JOB_NUMBER/SUBJOB_NUMBER/*.root')
     parser.add_argument('--output-dir', type=Path, default=OUTPUT_DIR,
                         help='EOS copy destination; overrides OUTPUT_DIR '
-                             '(default: DIRECTORY/generated). Created after simulation.')
+                             '(default: PROD_DATE/generated). Created after simulation.')
     parser.add_argument('--submit', action='store_true')
     parser.add_argument('--test', action='store_true',
                         help='First eligible file only, at most 100 DIS interactions')
     args = parser.parse_args()
     directory = args.directory.expanduser().resolve()
-    output_dir = (args.output_dir or directory / 'generated').expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else None
     installation = FS_INSTALL.expanduser().resolve()
     if not directory.is_dir():
         parser.error(f'Not a directory: {directory}')
@@ -71,14 +74,23 @@ def main():
     wrapper = worker.with_name('wn_script_pixi.py')
     jobs = []
     seen = set()
+    outputs = {}
     for source in sorted(directory.rglob(INPUT_PATTERN)):
         resolved = source.resolve()
         if (not source.is_file() or resolved in seen or output_dir in resolved.parents
+                or 'generated' in source.relative_to(directory).parent.parts
                 or '_backup' in source.stem):
             continue
         seen.add(resolved)
-        destination = output_dir / source.relative_to(directory).with_suffix('')
-        if os.path.lexists(destination):
+        destination = output_dir or source.parents[2] / 'generated'
+        tag = output_tag(source)
+        key = (destination, tag)
+        if key in outputs:
+            parser.error(f'Inputs map to the same output {destination / ("sim_" + tag + ".root")}: '
+                         f'{outputs[key]} and {source}')
+        outputs[key] = source
+        if any(os.path.lexists(destination / f'{prefix}_{tag}.root')
+               for prefix in ('sim', 'params', 'geo')):
             print(f'Skipping existing output: {destination}', flush=True)
             continue
         seed = 0 if SEED == 0 else (SEED - 1 + len(jobs)) % 900000000 + 1
@@ -95,7 +107,7 @@ def main():
             print('Simulation command (inside the FairShip Pixi environment): '
                   + shlex.join(['python3', str(installation / 'macro/run_simScript.py'),
                                 '-f', str(source), '-o', 'generator_output',
-                                '--tag', 'newmudis', *job_options]), flush=True)
+                                '--tag', tag, *job_options]), flush=True)
             break
     print(f'{len(jobs)} jobs {"to submit" if args.submit else "(preview; use --submit to submit)"}', flush=True)
     if not args.submit or not jobs:

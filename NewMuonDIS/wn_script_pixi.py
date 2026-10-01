@@ -64,6 +64,7 @@ def main():
     command = f"""
     export FS_INSTALL="{FS_INSTALL}"
     export PATH="/afs/cern.ch/work/a/ammagnan/.pixi/bin:$PATH"
+    export QT_QPA_PLATFORM=offscreen
     echo "eval \\\"$(pixi shell-hook --manifest-path {FS_INSTALL}/pixi.toml)\\\""
     eval "$(pixi shell-hook --manifest-path {FS_INSTALL}/pixi.toml)"
     which python3

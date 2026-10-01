@@ -9,6 +9,8 @@ import re
 import shlex
 import statistics
 
+from checkPrepareEventsOutputs import output_locations, root_statistics
+
 
 NUMBER = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
 WDIS_SCALE = 0.006 * 1e-27 * 6.02214076e23
@@ -90,10 +92,13 @@ def main():
     problems = []
     results = []
     excluded = []
+    weighted_results = []
+    weight_problems = []
     for job_id in range(args.first_job, args.first_job + args.num_jobs):
         logfile = base / str(job_id) / 'output/stdout'
         try:
-            status, result = parse_stdout(logfile.read_text(errors='replace'))
+            log_text = logfile.read_text(errors='replace')
+            status, result = parse_stdout(log_text)
         except FileNotFoundError:
             status, result = 'missing stdout', None
         except OSError as error:
@@ -106,6 +111,22 @@ def main():
         statuses[status] += 1
         if result is not None:
             results.append(result)
+            destinations = re.findall(r'^Output copy completed: (.+)$', log_text, re.MULTILINE)
+            try:
+                if not destinations:
+                    destinations = output_locations(base / str(job_id))
+                if len(destinations) != 1:
+                    weight_problems.append(f'{job_id}: missing or ambiguous ROOT output path')
+                    continue
+                weight_status, weights = root_statistics(destinations[0], weights_only=True)
+                if weights is None:
+                    weight_problems.append(f'{job_id}: {weight_status}')
+                elif weights['written'] != result['selected']:
+                    weight_problems.append(f'{job_id}: ROOT entries differ from selected log count')
+                else:
+                    weighted_results.append(weights['weighted_muons'])
+            except OSError as error:
+                weight_problems.append(f'{job_id}: cannot read output locations ({error})')
         else:
             problems.append(f'{job_id}: {status}')
     print(f'Jobs {args.first_job}–{args.first_job + args.num_jobs - 1}')
@@ -123,6 +144,12 @@ def main():
         print(f'{"Quantity":<30} {"Sum":>15} {"Mean/job":>15} {"SD/job":>15}')
         for key in ('processed', 'selected', 'skipped'):
             print_stats('Muon entries ' + key, [result[key] for result in results])
+        print('Weighted muons = sum(muon_MCTracks.fW[0]); no DIS scaling applied.')
+        print(f'Muon weights available for {len(weighted_results)}/{len(results)} successful jobs.')
+        if weighted_results:
+            print_stats('Muons selected weighted', weighted_results)
+        if weight_problems:
+            print('WARNING: weighted-muon statistics use only jobs with readable, matching ROOT output.')
         processed = sum(result['processed'] for result in results)
         selected = sum(result['selected'] for result in results)
         print(f'Muon selection: {selected}/{processed}'
@@ -144,6 +171,9 @@ def main():
     if excluded:
         print('\nExcluded jobs (different filter option):')
         print('\n'.join(excluded))
+    if weight_problems:
+        print('\nJobs with unavailable muon weights:')
+        print('\n'.join(weight_problems))
 
 
 if __name__ == '__main__':

@@ -27,7 +27,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 
-WDIS_SCALE = 0.006*1e-27 * 6.02214076e23
+WDIS_SCALE = 0.006 * 1e-27 * 6.02214076e23
 MATERIALS = ('MS', 'UBT', 'SBTsens', 'SBTfr', 'SSTsens', 'SSTfr', 'HE', 'AIR',
              'REST')
 
@@ -94,7 +94,7 @@ def parse_stdout(text, output):
     }
 
 
-def root_statistics(filename):
+def root_statistics(filename, weights_only=False):
     """Open a MuonDIS output and return its counts, or a diagnostic string."""
     try:
         import ROOT
@@ -110,7 +110,10 @@ def root_statistics(filename):
             os.dup2(diagnostics.fileno(), 2)
             with redirect_stderr(diagnostics):
                 try:
-                    status, result = read_root_statistics(ROOT, filename)
+                    if weights_only:
+                        status, result = read_root_statistics(ROOT, filename, weights_only=True)
+                    else:
+                        status, result = read_root_statistics(ROOT, filename)
                 except (OSError, RuntimeError, ValueError, OverflowError) as error:
                     status, result = f'corrupt or unreadable ROOT file ({error})', None
                 finally:
@@ -130,7 +133,28 @@ def root_statistics(filename):
     return status, result
 
 
-def read_root_statistics(ROOT, filename):
+def read_muon_weight_sum(tree):
+    """Sum the first track's weight once per muon, excluding daughter tracks."""
+    branch = 'muon_MCTracks.fW'
+    if not tree.GetBranch(branch):
+        raise ValueError(f'missing branch {branch}')
+    # Bound Draw's result buffer and read only the split weight branch.
+    chunk_size = 10000
+    tree.SetEstimate(chunk_size + 1)
+    totals = []
+    for first in range(0, int(tree.GetEntries()), chunk_size):
+        count = min(chunk_size, int(tree.GetEntries()) - first)
+        read = tree.Draw(branch + '[0]', '', 'goff', count, first)
+        if read != count:
+            raise ValueError(f'cannot read one muon weight per entry from {branch}')
+        values = [tree.GetV1()[index] for index in range(read)]
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError(f'non-finite {branch}')
+        totals.append(math.fsum(values))
+    return math.fsum(totals)
+
+
+def read_root_statistics(ROOT, filename, weights_only=False):
     """Read the statistics while root_statistics monitors ROOT diagnostics."""
     root_file = ROOT.TFile.Open(filename, 'READ')
     if not root_file:
@@ -143,6 +167,11 @@ def read_root_statistics(ROOT, filename):
         tree = root_file.Get('MuonDIS')
         if not tree or not tree.InheritsFrom('TTree'):
             return 'corrupt ROOT file (missing MuonDIS tree)', None
+        weighted_muons = read_muon_weight_sum(tree)
+        if weights_only:
+            return 'successful', {'written': int(tree.GetEntries()),
+                                  'weighted_muons': weighted_muons}
+        tree.SetEstimate(int(tree.GetEntries()) + 1)
         branches = ['muon_nDISevt_' + material for material in MATERIALS]
         branches += ['muon_wDIS_' + material for material in MATERIALS]
         missing = [branch for branch in branches if not tree.GetBranch(branch)]
@@ -167,7 +196,8 @@ def read_root_statistics(ROOT, filename):
             if not math.isfinite(weighted):
                 return f'corrupt ROOT tree (non-finite {weighted_expression})', None
             materials[material] = (raw, weighted * WDIS_SCALE)
-        return 'successful', {'written': int(tree.GetEntries()), 'materials': materials}
+        return 'successful', {'written': int(tree.GetEntries()), 'materials': materials,
+                              'weighted_muons': weighted_muons}
     finally:
         root_file.Close()
 
@@ -274,11 +304,13 @@ def main():
         print(f'  Job-directory problem — {status}: {count}')
     if results:
         print('\nStatistics include only successful subjobs with valid MuonDIS output.')
-        print(f'All weighted DIS counts scaled by {WDIS_SCALE:.8g} (1e-27 × 6.02214076e23).')
+        print(f'All weighted DIS counts scaled by {WDIS_SCALE:.8g} (0.006 * 1e-27 × 6.02214076e23).')
+        print('Weighted muons = sum(muon_MCTracks.fW[0]); no DIS scaling applied.')
         print('SD = population standard deviation of per-subjob counts about their mean.')
         print(f'{"Quantity":<30} {"Sum":>15} {"Mean/subjob":>15} {"SD/subjob":>15}')
         for key, label in (('processed', 'Input entries processed'),
                            ('written', 'MuonDIS entries written'),
+                           ('weighted_muons', 'Muons written weighted'),
                            ('mu_plus', 'Muons mu+'), ('mu_minus', 'Muons mu-'),
                            ('skipped_events', 'Skipped malformed/non-muon'),
                            ('skipped_low_p', 'Skipped low-p muons'),
