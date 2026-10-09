@@ -8,6 +8,10 @@ The argument contains numbered Ganga master-job directories.  The script
 discovers each job's ``JOB_ID/SUBJOB_ID/output/stdout`` files, reads the EOS
 destination recorded by Ganga, and does not modify files.
 
+By default, only local logs and output-location records are read; ROOT files
+are not opened.  Add --check-root to validate outputs and include ROOT-derived
+entry counts, muon weights, and DIS statistics.
+
 All recorded ROOT outputs excluded from the summary statistics are written as
 safely quoted ``rm`` commands to an executable ``rmcommand.sh`` in the current
 working directory, including outputs of failed or incomplete jobs.
@@ -224,6 +228,9 @@ def main():
                         help='First Ganga master job ID to check')
     parser.add_argument('--num-jobs', type=int, required=True,
                         help='Number of consecutive master jobs to check')
+    parser.add_argument('--check-root', action='store_true',
+                        help='Open and check all recorded ROOT outputs and read their statistics '
+                             '(default: fast, local logs only)')
     args = parser.parse_args()
     base = args.path.expanduser()
     if not base.is_dir():
@@ -264,14 +271,15 @@ def main():
                 log_status, log_result = 'missing stdout', None
             except OSError as error:
                 log_status, log_result = f'unreadable stdout ({error})', None
-            # Failed/incomplete worker logs can still have a transferred file.
-            # Check it as well so corrupt outputs are not silently omitted.
             root_status, root_result = None, None
-            for filename in outputs:
-                root_status, root_result = root_statistics(filename)
-                if root_result is None:
-                    problems.append(f'{label}: {root_status}: {filename}')
-            if log_result is None or root_result is None:
+            if args.check_root:
+                # Failed/incomplete worker logs can still have a transferred file.
+                # Check it as well so corrupt outputs are not silently omitted.
+                for filename in outputs:
+                    root_status, root_result = root_statistics(filename)
+                    if root_result is None:
+                        problems.append(f'{label}: {root_status}: {filename}')
+            if log_result is None or (args.check_root and root_result is None):
                 # Count each excluded subjob once; retain additional ROOT
                 # diagnostics in the detailed problems list below.
                 status = log_status if log_result is None else root_status
@@ -284,7 +292,8 @@ def main():
                 excluded_outputs.extend(outputs)
                 continue
             statuses['successful'] += 1
-            log_result.update(root_result)
+            if args.check_root:
+                log_result.update(root_result)
             results.append(log_result)
             included_outputs.add(eos_path(output) or output)
 
@@ -292,8 +301,12 @@ def main():
     print(f'Subjobs discovered: {discovered_subjobs}')
     success_rate = (f'{100 * len(results) / discovered_subjobs:.2f}%'
                     if discovered_subjobs else 'undefined')
-    print(f'Successful subjobs with valid ROOT output: {len(results)}/{discovered_subjobs} '
+    success_label = ('Successful subjobs with valid ROOT output' if args.check_root
+                     else 'Successful subjobs according to logs')
+    print(f'{success_label}: {len(results)}/{discovered_subjobs} '
           f'({success_rate})')
+    if not args.check_root:
+        print('Fast mode: ROOT outputs not checked; use --check-root for validation and ROOT statistics.')
     print(f'Excluded subjobs: {discovered_subjobs - len(results)} '
           '(one primary reason per subjob below)')
     for status, count in sorted(statuses.items()):
@@ -303,9 +316,12 @@ def main():
     for status, count in sorted(job_problems.items()):
         print(f'  Job-directory problem — {status}: {count}')
     if results:
-        print('\nStatistics include only successful subjobs with valid MuonDIS output.')
-        print(f'All weighted DIS counts scaled by {WDIS_SCALE:.8g} (0.006 * 1e-27 × 6.02214076e23).')
-        print('Weighted muons = sum(muon_MCTracks.fW[0]); no DIS scaling applied.')
+        if args.check_root:
+            print('\nStatistics include only successful subjobs with valid MuonDIS output.')
+            print(f'All weighted DIS counts scaled by {WDIS_SCALE:.8g} (0.006 * 1e-27 × 6.02214076e23).')
+            print('Weighted muons = sum(muon_MCTracks.fW[0]); no DIS scaling applied.')
+        else:
+            print('\nStatistics include only subjobs with successful logs and a recorded output path.')
         print('SD = population standard deviation of per-subjob counts about their mean.')
         print(f'{"Quantity":<30} {"Sum":>15} {"Mean/subjob":>15} {"SD/subjob":>15}')
         for key, label in (('processed', 'Input entries processed'),
@@ -315,7 +331,10 @@ def main():
                            ('skipped_events', 'Skipped malformed/non-muon'),
                            ('skipped_low_p', 'Skipped low-p muons'),
                            ('skipped_acceptance', 'Skipped acceptance')):
+            if not args.check_root and key in ('written', 'weighted_muons'):
+                continue
             print_stats(label, [result[key] for result in results])
+    if results and args.check_root:
         processed = sum(result['processed'] for result in results)
         written = sum(result['written'] for result in results)
         print(f'MuonDIS written: {written}/{processed}'

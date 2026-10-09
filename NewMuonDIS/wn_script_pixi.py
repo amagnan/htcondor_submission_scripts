@@ -58,18 +58,23 @@ def main():
     script_args = args.script_args[1:] if args.script_args[:1] == ["--"] else args.script_args
     passthrough = " ".join(shlex.quote(a) for a in script_args)
 
-    print(f"INFO: Executing: python3 {RUN_SCRIPT} {passthrough}")
+    print(f"INFO: Executing: pixi cvmfs python3 {RUN_SCRIPT} {passthrough}")
+    #print(f"INFO: Executing: python3 {RUN_SCRIPT} {passthrough}")
 
     # Build bash command
     command = f"""
     export FS_INSTALL="{FS_INSTALL}"
-    export PATH="/afs/cern.ch/work/a/ammagnan/.pixi/bin:$PATH"
     export QT_QPA_PLATFORM=offscreen
-    echo "eval \\\"$(pixi shell-hook --manifest-path {FS_INSTALL}/pixi.toml)\\\""
-    eval "$(pixi shell-hook --manifest-path {FS_INSTALL}/pixi.toml)"
-    which python3
-    python3 "{RUN_SCRIPT}" {passthrough}
+    export PATH=/cvmfs/ship-nightlies.cern.ch/pixi/0.72.0-rattlerfs-layers-d5a7568/bin:$PATH
+    export PATH=/afs/cern.ch/work/a/ammagnan/:$PATH
+    pixi cvmfs "{FS_INSTALL}" python3 "{RUN_SCRIPT}" {passthrough}
     """
+
+    #export PATH="/afs/cern.ch/work/a/ammagnan/.pixi/bin:$PATH"
+    #echo "eval \\\"$(pixi shell-hook --manifest-path {FS_INSTALL}/pixi.toml)\\\""
+    #eval "$(pixi shell-hook --manifest-path {FS_INSTALL}/pixi.toml)"
+    #python3 "{RUN_SCRIPT}" {passthrough}
+
 
     print("Command being run: ",command)
     subprocess.run(["bash", "-c", command], check=True)
