@@ -33,7 +33,40 @@ from urllib.parse import urlsplit
 
 WDIS_SCALE = 0.006 * 1e-27 * 6.02214076e23
 MATERIALS = ('MS', 'UBT', 'SBTsens', 'SBTfr', 'SSTsens', 'SSTfr', 'HE', 'AIR',
-             'REST')
+             'HeBalloon', 'REST')
+NUMBER = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?'
+
+
+def parse_path_diagnostics(text):
+    """Read the five diagnostic lines printed by MuGeoProcessor."""
+    patterns = (
+        r'Muon path diagnostics: (?P<considered>\d+) muons considered, '
+        r'(?P<non_forward>\d+) rejected for non-forward momentum, '
+        r'(?P<invalid_measurements>\d+) rejected for invalid measurements',
+        r'Muon path routes prepared \(before material navigation\): '
+        r'(?P<ubt_backward>\d+) from UBT with backward extrapolation, '
+        r'(?P<mc_field>\d+) from MC start in field, '
+        r'(?P<mc_field_free>\d+) from MC start in field-free region '
+        r'\(bending on field entry\); (?P<beyond_zmax>\d+) skipped with start z >= maximum z',
+        r'UBT backward paths missing MS: (?P<ubt_missing_ms>\d+)',
+        rf'Muons starting before z = (?P<z_min_cm>{NUMBER}) cm '
+        r'\(paths still built\): (?P<before_zmin>\d+)',
+        r'POCA transverse jumps: (?P<large_jumps>\d+) of (?P<transitions>\d+) '
+        rf'transitions exceed (?P<jump_threshold_cm>{NUMBER}) cm, in '
+        r'(?P<muons_with_large_jumps>\d+) muons; '
+        rf'maximum jump = (?P<max_jump_cm>{NUMBER}) cm',
+    )
+    diagnostics = {}
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text))
+        if len(matches) != 1:
+            return None
+        for key, value in matches[0].groupdict().items():
+            diagnostics[key] = float(value) if key.endswith('_cm') else int(value)
+    if any(not math.isfinite(value) for key, value in diagnostics.items()
+           if key.endswith('_cm')):
+        return None
+    return diagnostics
 
 
 def natural_key(path):
@@ -75,7 +108,8 @@ def parse_stdout(text, output):
     range_match = re.findall(r'- Processing event (\d+) to event (-?\d+)', text)
     summary_match = re.findall(
         r'Found (\d+) mu\+ and (\d+) mu-\.\s*\nSkipped: (\d+) events and '
-        r'(\d+) muons with too low p, (\d+) muons outside of acceptance\.', text)
+        r'(\d+) muons with too low p\s*\nCounted: (\d+) muons with no recorded '
+        r'hits in UBT,SBT,SST,TD\.', text)
     if (len(input_match) != 1 or len(range_match) != 1 or len(summary_match) != 1
             or output is None):
         return 'incomplete (missing or ambiguous prepareEvents summary/output)', None
@@ -85,15 +119,18 @@ def parse_stdout(text, output):
     processed = max(0, last - first + 1)
     if first < 0 or last >= input_entries:
         return 'incomplete (invalid processed range)', None
-    positive, negative, skipped_events, skipped_low_p, skipped_acceptance = map(
-        int, summary_match[0])
+    positive, negative, skipped_events, skipped_low_p, no_hits = map(int, summary_match[0])
+    diagnostics = parse_path_diagnostics(text)
+    if diagnostics is None:
+        return 'incomplete (missing, ambiguous or invalid muon path diagnostics)', None
     return 'successful log', {
         'processed': processed,
         'mu_plus': positive,
         'mu_minus': negative,
         'skipped_events': skipped_events,
         'skipped_low_p': skipped_low_p,
-        'skipped_acceptance': skipped_acceptance,
+        'no_hits': no_hits,
+        'path_diagnostics': diagnostics,
         'output': output,
     }
 
@@ -215,9 +252,42 @@ def eos_path(filename):
     return path if path.startswith('/eos/') else None
 
 
-def print_stats(label, values):
-    print(f'{label:<30} {sum(values):>15.8g} {statistics.mean(values):>15.8g} '
+def print_stats(label, values, width=30):
+    print(f'{label:<{width}} {sum(values):>15.8g} {statistics.mean(values):>15.8g} '
           f'{statistics.pstdev(values):>15.8g}')
+
+
+def print_path_statistics(results):
+    """Aggregate counts at matching thresholds and take the largest jump."""
+    groups = {}
+    for result in results:
+        diagnostics = result['path_diagnostics']
+        settings = (diagnostics['z_min_cm'], diagnostics['jump_threshold_cm'])
+        groups.setdefault(settings, []).append(diagnostics)
+    for (z_min, threshold), diagnostics in sorted(groups.items()):
+        print(f'\nMuon path diagnostics: {len(diagnostics)} subjobs '
+              f'(minimum z = {z_min:g} cm, POCA threshold = {threshold:g} cm).')
+        print('Routes are counted before material navigation; starts below minimum z '
+              'still have paths built.')
+        print(f'{"Quantity":<50} {"Sum":>15} {"Mean/subjob":>15} {"SD/subjob":>15}')
+        for key, label in (
+                ('considered', 'Muons considered'),
+                ('non_forward', 'Muons rejected: non-forward momentum'),
+                ('invalid_measurements', 'Muons rejected: invalid measurements'),
+                ('ubt_backward', 'Muons from UBT with backward extrapolation'),
+                ('mc_field', 'Muons from MC start in field'),
+                ('mc_field_free', 'Muons from MC start in field-free region'),
+                ('beyond_zmax', 'Muons skipped: start z >= maximum z'),
+                ('ubt_missing_ms', 'UBT backward paths missing MS'),
+                ('before_zmin', f'Muons starting before z = {z_min:g} cm'),
+                ('transitions', 'POCA transitions'),
+                ('large_jumps', f'POCA transitions exceeding {threshold:g} cm'),
+                ('muons_with_large_jumps', f'Muons with POCA jumps exceeding {threshold:g} cm')):
+            print_stats(label, [item[key] for item in diagnostics], width=50)
+        print('Maximum POCA transverse jump across subjobs: '
+              f'{max(item["max_jump_cm"] for item in diagnostics):.8g} cm')
+        print('Maximum POCA transverse jump per subjob (cm, job/subjob order): '
+              + ', '.join(f'{item["max_jump_cm"]:.8g}' for item in diagnostics))
 
 
 def main():
@@ -330,7 +400,7 @@ def main():
                            ('mu_plus', 'Muons mu+'), ('mu_minus', 'Muons mu-'),
                            ('skipped_events', 'Skipped malformed/non-muon'),
                            ('skipped_low_p', 'Skipped low-p muons'),
-                           ('skipped_acceptance', 'Skipped acceptance')):
+                           ('no_hits', 'Counted no detector hits')):
             if not args.check_root and key in ('written', 'weighted_muons'):
                 continue
             print_stats(label, [result[key] for result in results])
@@ -348,6 +418,8 @@ def main():
             print_stats('DIS ALL materials ' + label,
                         [sum(value[index] for value in result['materials'].values())
                          for result in results])
+    if results:
+        print_path_statistics(results)
     if problems:
         print('\nSubjobs requiring attention:')
         print('\n'.join(problems))

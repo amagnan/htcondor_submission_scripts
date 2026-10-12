@@ -16,7 +16,7 @@ FS_INSTALL = Path('/afs/cern.ch/work/a/ammagnan/FairShip')
 SITE = 'CERN'
 GANGA = '/cvmfs/ganga.cern.ch/Ganga/install/ship/bin/ganga'
 MAX_RUNTIME = 86000
-INPUT_PATTERN = '*_filtered_1.root'  # Recursive; use a prepared-file pattern if needed.
+INPUT_PATTERN = '*.root'  # Recursive; use a prepared-file pattern if needed.
 OUTPUT_DIR = None  # EOS destination (Path('/eos/...')); None uses PROD_DATE/generated.
 # Workers always generate in their local working directory before copying to OUTPUT_DIR.
 N_EVENTS = -1  # All stored DIS interactions in each file; --test limits this to 100.
@@ -25,9 +25,9 @@ SEED = 0  # FairShip chooses a time-based seed; nonzero values increment per job
 
 # --shieldName selects both shield geometry and files/<name>.root in FairShip.
 # The current macro supports TRY_2025 and TRY_2026, with no separate shield-map flag.
-MUON_SHIELD_NAME = 'TRY_2025'
+MUON_SHIELD_NAME = 'TRY_2026'
 # Keep this relative to FairShip: ShipFieldMaker prepends VMCWORKDIR.
-SPECTROMETER_FIELD_MAP = 'files/2026_05_07_MainSpectrometerField_V21_3000.root'
+#SPECTROMETER_FIELD_MAP = 'files/2026_05_07_MainSpectrometerField_V21_3000.root'
 STRAW_DESIGN = 10
 ENABLE_SND = False
 DEBUG = 0
