@@ -9,7 +9,8 @@ discovers each job's ``JOB_ID/SUBJOB_ID/output/stdout`` files, reads the EOS
 destination recorded by Ganga, and does not modify files.
 
 By default, only local logs and output-location records are read; ROOT files
-are not opened.  Add --check-root to validate outputs and include ROOT-derived
+are not opened. Add --metadata for tree-header normalization records only,
+or --check-root to validate outputs and include ROOT-derived
 entry counts, muon weights, and DIS statistics.
 
 All recorded ROOT outputs excluded from the summary statistics are written as
@@ -69,15 +70,142 @@ def parse_path_diagnostics(text):
     return diagnostics
 
 
+def parse_extra_diagnostics(text):
+    """Accept legacy logs; reject partial/duplicate new diagnostic blocks."""
+    patterns = (
+        rf'Weighted counts \(sum MCTrack\[0\]\.fW\): (?P<mu_plus>{NUMBER}) mu\+ and '
+        rf'(?P<mu_minus>{NUMBER}) mu- \(after momentum cut\)\.',
+        rf'Skipped \(sum MCTrack\[0\]\.fW\): (?P<low_p>{NUMBER}) with too low p, '
+        rf'(?P<invalid_paths>{NUMBER}) muons with invalid or empty paths\.',
+        rf'Counted \(sum MCTrack\[0\]\.fW\): (?P<no_hits>{NUMBER}) '
+        r'muons with no recorded hits in UBT,SBT,SST,TD\.',
+        rf'Muon path diagnostics \(sum MCTrack\[0\]\.fW\): (?P<considered>{NUMBER}) considered, '
+        rf'(?P<non_forward>{NUMBER}) rejected for non-forward momentum, '
+        rf'(?P<invalid_measurements>{NUMBER}) rejected for invalid measurements',
+        rf'Muon path routes prepared \(sum MCTrack\[0\]\.fW\): (?P<ubt_backward>{NUMBER}) from UBT, '
+        rf'(?P<mc_field>{NUMBER}) from MC start in field, '
+        rf'(?P<mc_field_free>{NUMBER}) from MC start in field-free region, '
+        rf'(?P<beyond_zmax>{NUMBER}) skipped with start z >= maximum z',
+        rf'UBT backward paths missing MS \(sum MCTrack\[0\]\.fW\): (?P<ubt_missing_ms>{NUMBER})',
+        rf'Muons starting before z = {NUMBER} cm \(sum MCTrack\[0\]\.fW\): (?P<before_zmin>{NUMBER})',
+        rf'Muons with large POCA transverse jumps \(sum MCTrack\[0\]\.fW\): (?P<large_jumps>{NUMBER})',
+    )
+    result = {}
+    if '(sum MCTrack[0].fW)' in text:
+        weighted = {}
+        for pattern in patterns:
+            matches = list(re.finditer(pattern, text))
+            if len(matches) != 1:
+                raise ValueError('missing or ambiguous weighted diagnostics')
+            weighted.update({key: float(value) for key, value in matches[0].groupdict().items()})
+        if not all(math.isfinite(value) for value in weighted.values()):
+            raise ValueError('non-finite weighted diagnostics')
+        result['weighted_diagnostics'] = weighted
+    if 'Muon path totals' in text:
+        totals = {}
+        for material in ('ALL', *MATERIALS):
+            prefix = (r'\(cm, excluding REST\): output' if material == 'ALL'
+                      else re.escape(material) + r' \(cm\): crossing')
+            pattern = (rf'Muon path totals {prefix} muons = (?P<muons>\d+), '
+                       rf'sum\(fW\) = (?P<weight>{NUMBER}), sum\(L\) = (?P<length>{NUMBER}), '
+                       rf'sum\(fW\*L\) = (?P<weighted_length>{NUMBER})')
+            matches = list(re.finditer(pattern, text))
+            if len(matches) != 1:
+                raise ValueError('missing or ambiguous path totals')
+            values = {key: int(value) if key == 'muons' else float(value)
+                      for key, value in matches[0].groupdict().items()}
+            if not all(math.isfinite(value) for value in values.values()):
+                raise ValueError('non-finite path totals')
+            totals[material] = values
+        result['path_totals'] = totals
+    return result
+
+
+def read_normalization(tree):
+    """Read version-1 TList metadata without reading any event baskets."""
+    metadata = tree.GetUserInfo().FindObject('muDIS_normalization')
+    if not metadata:
+        return None
+    version = metadata.FindObject('version')
+    if not version or int(version.GetVal()) != 1:
+        raise ValueError('unsupported normalization metadata version')
+    complete = metadata.FindObject('preparation_complete')
+    records = {}
+    for item in metadata:
+        if not item.InheritsFrom('TList'):
+            continue
+        stage = item.FindObject('stage')
+        if not stage or stage.GetTitle() not in ('prepareEvents', 'filterEvents', 'NewMuDISGenerator'):
+            raise ValueError('invalid normalization stage')
+        record = {'stage': str(stage.GetTitle())}
+        for key in ('input_muons', 'sum_weights', 'sum_weights_squared'):
+            value = item.FindObject(key)
+            if not value:
+                raise ValueError(f'missing normalization field {key}')
+            record[key] = int(value.GetVal()) if key == 'input_muons' else float(value.GetVal())
+            if not math.isfinite(record[key]) or (key != 'sum_weights' and record[key] < 0):
+                raise ValueError(f'invalid normalization field {key}')
+        identity = str(item.GetName())
+        if identity in records and records[identity] != record:
+            raise ValueError('conflicting normalization UUID')
+        records[identity] = record
+    return {'complete': bool(complete and complete.GetVal()), 'records': records}
+
+
+def print_extra_statistics(results):
+    weighted = [result['weighted_diagnostics'] for result in results if 'weighted_diagnostics' in result]
+    if weighted:
+        print(f'\nWeighted diagnostics: {len(weighted)}/{len(results)} subjobs; sum MCTrack[0].fW (no DIS scaling).')
+        for key in weighted[0]:
+            print_stats(key.replace('_', ' '), [item[key] for item in weighted])
+    totals = [result['path_totals'] for result in results if 'path_totals' in result]
+    if totals:
+        print(f'\nPath lengths: {len(totals)}/{len(results)} subjobs; means are ratios of combined totals.')
+        print('ALL excludes REST; material means use crossing muons only.')
+        for material in ('ALL', *MATERIALS):
+            combined = {key: math.fsum(item[material][key] for item in totals)
+                        for key in ('muons', 'weight', 'length', 'weighted_length')}
+            mean = combined['length'] / combined['muons'] if combined['muons'] else None
+            weighted_mean = combined['weighted_length'] / combined['weight'] if combined['weight'] else None
+            print(f'{material}: sum(L)={combined["length"]:.8g} cm, '
+                  f'sum(fW*L)={combined["weighted_length"]:.8g} cm, '
+                  f'mean L={mean if mean is not None else "undefined"}, '
+                  f'weighted mean L={weighted_mean if weighted_mean is not None else "undefined"} cm')
+
+
+def print_normalization_statistics(results):
+    records = {}
+    available = complete = 0
+    for result in results:
+        metadata = result.get('normalization')
+        if metadata is None:
+            continue
+        available += 1
+        complete += metadata['complete']
+        for identity, record in metadata['records'].items():
+            if identity in records and records[identity] != record:
+                raise ValueError(f'conflicting normalization UUID: {identity}')
+            records[identity] = record
+    print(f'\nNormalization metadata: {available}/{len(results)} outputs; '
+          f'preparation complete: {complete}/{len(results)}. Records deduplicated by UUID.')
+    for stage in ('prepareEvents', 'filterEvents', 'NewMuDISGenerator'):
+        selected = [record for record in records.values() if record['stage'] == stage]
+        if selected:
+            print(stage + ' (input muons before selection): ' + ', '.join(
+                f'{key}={math.fsum(record[key] for record in selected):.12g}'
+                for key in ('input_muons', 'sum_weights', 'sum_weights_squared')))
+
 def natural_key(path):
     """Sort Ganga subjob names numerically where possible."""
     return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
 
 
-def subjob_logs(job_dir):
+def subjob_logs(job_dir, include_unsplit=False):
     """Return LocalXML (subjob label, stdout path) pairs for a Ganga job."""
     directories = [item for item in job_dir.iterdir()
                    if item.is_dir() and item.name.isdigit()]
+    if include_unsplit and not directories and (job_dir / 'output').is_dir():
+        return [('.', job_dir / 'output/stdout')]
     return [(directory.name, directory / 'output/stdout')
             for directory in sorted(directories, key=natural_key)]
 
@@ -123,7 +251,12 @@ def parse_stdout(text, output):
     diagnostics = parse_path_diagnostics(text)
     if diagnostics is None:
         return 'incomplete (missing, ambiguous or invalid muon path diagnostics)', None
+    try:
+        extra = parse_extra_diagnostics(text)
+    except ValueError as error:
+        return f'incomplete ({error})', None
     return 'successful log', {
+        **extra,
         'processed': processed,
         'mu_plus': positive,
         'mu_minus': negative,
@@ -135,7 +268,7 @@ def parse_stdout(text, output):
     }
 
 
-def root_statistics(filename, weights_only=False):
+def root_statistics(filename, weights_only=False, metadata_only=False, include_metadata=False):
     """Open a MuonDIS output and return its counts, or a diagnostic string."""
     try:
         import ROOT
@@ -151,7 +284,11 @@ def root_statistics(filename, weights_only=False):
             os.dup2(diagnostics.fileno(), 2)
             with redirect_stderr(diagnostics):
                 try:
-                    if weights_only:
+                    if metadata_only:
+                        status, result = read_root_statistics(ROOT, filename, metadata_only=True)
+                    elif include_metadata:
+                        status, result = read_root_statistics(ROOT, filename, include_metadata=True)
+                    elif weights_only:
                         status, result = read_root_statistics(ROOT, filename, weights_only=True)
                     else:
                         status, result = read_root_statistics(ROOT, filename)
@@ -195,7 +332,7 @@ def read_muon_weight_sum(tree):
     return math.fsum(totals)
 
 
-def read_root_statistics(ROOT, filename, weights_only=False):
+def read_root_statistics(ROOT, filename, weights_only=False, metadata_only=False, include_metadata=False):
     """Read the statistics while root_statistics monitors ROOT diagnostics."""
     root_file = ROOT.TFile.Open(filename, 'READ')
     if not root_file:
@@ -208,6 +345,10 @@ def read_root_statistics(ROOT, filename, weights_only=False):
         tree = root_file.Get('MuonDIS')
         if not tree or not tree.InheritsFrom('TTree'):
             return 'corrupt ROOT file (missing MuonDIS tree)', None
+        if metadata_only:
+            return 'successful', {'written': int(tree.GetEntries()),
+                                  'normalization': read_normalization(tree)}
+        metadata = {'normalization': read_normalization(tree)} if include_metadata else {}
         weighted_muons = read_muon_weight_sum(tree)
         if weights_only:
             return 'successful', {'written': int(tree.GetEntries()),
@@ -237,7 +378,7 @@ def read_root_statistics(ROOT, filename, weights_only=False):
             if not math.isfinite(weighted):
                 return f'corrupt ROOT tree (non-finite {weighted_expression})', None
             materials[material] = (raw, weighted * WDIS_SCALE)
-        return 'successful', {'written': int(tree.GetEntries()), 'materials': materials,
+        return 'successful', {**metadata, 'written': int(tree.GetEntries()), 'materials': materials,
                               'weighted_muons': weighted_muons}
     finally:
         root_file.Close()
@@ -301,6 +442,8 @@ def main():
     parser.add_argument('--check-root', action='store_true',
                         help='Open and check all recorded ROOT outputs and read their statistics '
                              '(default: fast, local logs only)')
+    parser.add_argument('--metadata', action='store_true',
+                        help='Read ROOT headers and normalization metadata, without scanning event branches')
     args = parser.parse_args()
     base = args.path.expanduser()
     if not base.is_dir():
@@ -321,7 +464,7 @@ def main():
             job_problems['missing job directory'] += 1
             problems.append(f'{job_id}: missing job directory')
             continue
-        logs = subjob_logs(job_dir)
+        logs = subjob_logs(job_dir, include_unsplit=True)
         if not logs:
             job_problems['no subjobs found'] += 1
             problems.append(f'{job_id}: no subjobs found')
@@ -342,14 +485,18 @@ def main():
             except OSError as error:
                 log_status, log_result = f'unreadable stdout ({error})', None
             root_status, root_result = None, None
-            if args.check_root:
+            if args.check_root or args.metadata:
                 # Failed/incomplete worker logs can still have a transferred file.
                 # Check it as well so corrupt outputs are not silently omitted.
                 for filename in outputs:
-                    root_status, root_result = root_statistics(filename)
+                    if args.metadata:
+                        root_status, root_result = root_statistics(
+                            filename, metadata_only=not args.check_root, include_metadata=args.check_root)
+                    else:
+                        root_status, root_result = root_statistics(filename)
                     if root_result is None:
                         problems.append(f'{label}: {root_status}: {filename}')
-            if log_result is None or (args.check_root and root_result is None):
+            if log_result is None or ((args.check_root or args.metadata) and root_result is None):
                 # Count each excluded subjob once; retain additional ROOT
                 # diagnostics in the detailed problems list below.
                 status = log_status if log_result is None else root_status
@@ -362,7 +509,7 @@ def main():
                 excluded_outputs.extend(outputs)
                 continue
             statuses['successful'] += 1
-            if args.check_root:
+            if args.check_root or args.metadata:
                 log_result.update(root_result)
             results.append(log_result)
             included_outputs.add(eos_path(output) or output)
@@ -375,7 +522,9 @@ def main():
                      else 'Successful subjobs according to logs')
     print(f'{success_label}: {len(results)}/{discovered_subjobs} '
           f'({success_rate})')
-    if not args.check_root:
+    if args.metadata and not args.check_root:
+        print('Metadata mode: ROOT headers checked; event baskets not validated.')
+    elif not args.check_root:
         print('Fast mode: ROOT outputs not checked; use --check-root for validation and ROOT statistics.')
     print(f'Excluded subjobs: {discovered_subjobs - len(results)} '
           '(one primary reason per subjob below)')
@@ -401,7 +550,7 @@ def main():
                            ('skipped_events', 'Skipped malformed/non-muon'),
                            ('skipped_low_p', 'Skipped low-p muons'),
                            ('no_hits', 'Counted no detector hits')):
-            if not args.check_root and key in ('written', 'weighted_muons'):
+            if (key == 'weighted_muons' and not args.check_root) or (key == 'written' and not (args.check_root or args.metadata)):
                 continue
             print_stats(label, [result[key] for result in results])
     if results and args.check_root:
@@ -420,6 +569,12 @@ def main():
                          for result in results])
     if results:
         print_path_statistics(results)
+        print_extra_statistics(results)
+        if args.metadata:
+            try:
+                print_normalization_statistics(results)
+            except ValueError as error:
+                problems.append(str(error))
     if problems:
         print('\nSubjobs requiring attention:')
         print('\n'.join(problems))

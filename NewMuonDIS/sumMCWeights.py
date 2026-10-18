@@ -1,14 +1,50 @@
 #!/usr/bin/env python3
-"""Recursively sum MCTrack[0].fW without ROOT or FairShip class dictionaries.
+"""Recursively sum first-track MC weights for one DIS production stage.
 
 Requires uproot, awkward and numpy. Reads only the split weight branch in
 chunks; empty track collections contribute zero and are reported separately.
+No ROOT or FairShip class dictionaries are needed.
+
+Example: python3 sumMCWeights.py /path/to/production --step disgen --test 2
+disgen also accepts legacy muonDis_cudaMu_*_evtSTART_END.root filenames.
+cuda selects all sim_*.root inputs recursively and reads cbmsim/MCTrack.fW.
 """
 
 import argparse
 import math
 from pathlib import Path
+import re
 import sys
+
+
+STAGES = {
+    'cuda': ('cbmsim', 'MCTrack.fW'),
+    'disgen': ('MuonDIS', 'muon_MCTracks.fW'),
+    'disfilter': ('MuonDIS', 'muon_MCTracks.fW'),
+    'disreplay_gen': ('cbmsim', 'MCTrack.fW'),
+    'disreplay_filter': ('cbmsim', 'MCTrack.fW'),
+}
+
+
+def production_files(directory, step):
+    files = []
+    for path in directory.rglob('*.root'):
+        if not path.is_file() or (step != 'cuda' and '_backup' in path.stem):
+            continue
+        if step == 'cuda':
+            matches = path.name.startswith('sim_')
+        elif step.startswith('disreplay'):
+            matches = path.name.startswith('sim_') and path.stem.endswith('_' + step)
+        else:
+            if path.name.startswith(('sim_', 'geo_', 'params_')):
+                continue
+            matches = path.stem.endswith('_' + step)
+            if step == 'disgen':
+                matches = matches or re.fullmatch(
+                    r'muonDis_cudaMu_.+_evt\d+_\d+\.root', path.name) is not None
+        if matches:
+            files.append(path)
+    return sorted(files)
 
 
 def sum_file(path, tree_name, branch_name, step_size):
@@ -44,9 +80,8 @@ def main():
     parser.add_argument('input_dir', type=Path)
     parser.add_argument('--test', '--max-files', type=int, metavar='N',
                         help='Process only the first N files (sorted by path)')
-    parser.add_argument('--tree', default='cbmsim', help='Tree name (default: cbmsim)')
-    parser.add_argument('--branch', default='MCTrack.fW',
-                        help='Split weight branch (default: MCTrack.fW)')
+    parser.add_argument('--step', required=True, choices=STAGES,
+                        help='Production stage; selects filenames, tree and weight branch')
     parser.add_argument('--step-size', default='100 MB',
                         help='Approximate input array size per chunk (default: 100 MB)')
     args = parser.parse_args()
@@ -62,28 +97,30 @@ def main():
     except ImportError:
         parser.error('Install dependencies with: python3 -m pip install uproot awkward numpy')
 
-    files = sorted(path for path in directory.rglob('*.root')
-                   if 'filtered' not in path.name)
+    tree_name, branch_name = STAGES[args.step]
+    weight_label = branch_name.replace('.fW', '[0].fW')
+    files = production_files(directory, args.step)
     selected = files if args.test is None else files[:args.test]
+    print(f'Stage={args.step}, tree={tree_name}, branch={branch_name}', flush=True)
     print(f'Files found={len(files)}, selected={len(selected)}', flush=True)
     total_entries = total_empty = processed = failed = 0
     sums = []
     for path in selected:
         try:
             entries, weight_sum, empty = sum_file(
-                path, args.tree, args.branch, args.step_size)
+                path, tree_name, branch_name, args.step_size)
         except Exception as error:
-            #print(f'ERROR {path}: {error}', file=sys.stderr, flush=True)
+            print(f'ERROR {path}: {error}', file=sys.stderr, flush=True)
             failed += 1
             continue
-        print(f'  sum(MCTrack[0].fW)={weight_sum:.17g}, empty_tracks={empty}', flush=True)
+        print(f'  sum({weight_label})={weight_sum:.17g}, empty_tracks={empty}', flush=True)
         total_entries += entries
         total_empty += empty
         sums.append(weight_sum)
         processed += 1
     print(f'TOTAL: processed={processed}/{len(files)} found, '
           f'selected={len(selected)}, failed={failed}')
-    print(f'  raw_entries={total_entries}, sum(MCTrack[0].fW)={math.fsum(sums):.17g}, '
+    print(f'  raw_entries={total_entries}, sum({weight_label})={math.fsum(sums):.17g}, '
           f'empty_tracks={total_empty}')
     print('  Totals include successfully processed files only.')
     return 1 if failed or not files else 0

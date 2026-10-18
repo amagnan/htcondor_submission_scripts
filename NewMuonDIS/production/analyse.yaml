@@ -1,0 +1,17 @@
+step: analyse
+tag: TRY2026
+production: 261009
+# Outputs: output_dir/analysis/analysis_name/<source-hash>/[subjob]/analysis_evt*.tar.gz
+analysis_name: replay_gen_v1
+# input_dir defaults to the production root; one job per matching ROOT file.
+n_jobs: -1
+n_subjobs: 1
+events_per_file: -1
+first_event: 0
+analysis:
+  type: disreplay_gen  # also disreplay_filter, disgen, disfilter
+  save_plots: false   # render plots once in mergeAnalysis.py
+  weight_factor: 3.6e-6
+  target_sum_weights: null
+  failed_job_factor: 1.0
+# Optional: plot_axes and geometry_file inside analysis, as in analyseEvents.yaml.

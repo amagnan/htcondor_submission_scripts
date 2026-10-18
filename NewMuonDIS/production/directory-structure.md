@@ -131,7 +131,9 @@ file. Choose replay spans for the stored counts, using separate selections or
 configurations when needed. Setting `E=12500` schedules 50 replay subjobs per
 prepared file (`r=0..49`), or 1,000 replay subjobs per original CUDA input; this
 is a configured span, not a guarantee that every prepared file contains that
-many muons. The last chunk is smaller when `E` is not a multiple of 250.
+many muons. When there are multiple subjobs, the last uses `-n -1` from its
+calculated start to include all remaining entries, even beyond `E`; its output
+name uses `all` as the range end.
 
 The current `disgen.yaml` specifies 10 subjobs over 250,000 entries; the requested
 diagram instead uses 20. The current `disreplay_gen.yaml` specifies

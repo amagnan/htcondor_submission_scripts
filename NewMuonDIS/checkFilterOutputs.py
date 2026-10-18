@@ -129,6 +129,14 @@ def main():
                 weight_problems.append(f'{job_id}: cannot read output locations ({error})')
         else:
             problems.append(f'{job_id}: {status}')
+            try:
+                destinations = output_locations(base / str(job_id))
+                if destinations:
+                    problems.extend(f'  Output: {filename}' for filename in destinations)
+                else:
+                    problems.append('  Output: no recorded ROOT output path')
+            except OSError as error:
+                problems.append(f'  Output: cannot read output locations ({error})')
     print(f'Jobs {args.first_job}–{args.first_job + args.num_jobs - 1}')
     if args.filter_option is not None:
         print(f'Filter option: {args.filter_option}; excluded other-option jobs: {len(excluded)}')
