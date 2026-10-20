@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import tarfile
 import subprocess
@@ -7,14 +8,25 @@ import shlex
 from pathlib import Path
 
 def prepare_analysis(source, config):
-    """Isolate one source for analyseEvents' directory discovery, preserving provenance."""
-    source = Path(source).resolve(strict=True)
+    """Isolate selected sources for analyseEvents' discovery, preserving provenance."""
+    if config['type'].startswith('disreplay') and config.get('geometry_file'):
+        geometry = Path(config['geometry_file']).expanduser().resolve()
+        if not geometry.is_file():
+            raise ValueError(f'Analysis geometry override is not accessible on the worker: {geometry}. '
+                             'Correct analysis.geometry_file or set it to null to use each input’s sibling geometry.')
+        config = dict(config, geometry_file=str(geometry))
+    sources = [source] if isinstance(source, (str, Path)) else source
     directory = Path('analysis-input')
     directory.mkdir()
-    (directory / source.name).symlink_to(source)
-    if config['type'].startswith('disreplay') and not config.get('geometry_file'):
-        geometry = source.with_name('geo_' + source.name[4:]).resolve(strict=True)
-        (directory / geometry.name).symlink_to(geometry)
+    for index, source in enumerate(sources):
+        source = Path(source).resolve(strict=True)
+        # Keep repeated basenames and their geometries separate, in chain order.
+        folder = directory if len(sources) == 1 else directory / f'{index:0{len(str(len(sources)))}d}'
+        folder.mkdir(exist_ok=True)
+        (folder / source.name).symlink_to(source)
+        if config['type'].startswith('disreplay') and not config.get('geometry_file'):
+            geometry = source.with_name('geo_' + source.name[4:]).resolve(strict=True)
+            (folder / geometry.name).symlink_to(geometry)
     config = dict(config, production_path=str(directory.resolve()))
     Path('analysis-config.json').write_text(json.dumps(config, indent=2, allow_nan=False))
 
@@ -58,8 +70,11 @@ def main():
         default = "newMuonDIS/prepareEvents.py"
     )
 
-    parser.add_argument('--analysis-source', help='Single ROOT source to stage for analyseEvents')
-    parser.add_argument('--analysis-config', help='JSON analyseEvents settings')
+    parser.add_argument('--analysis-source', action='append',
+                        help='ROOT source to stage for analyseEvents; repeat for multiple files')
+    analysis_config = parser.add_mutually_exclusive_group()
+    analysis_config.add_argument('--analysis-config', help='JSON analyseEvents settings')
+    analysis_config.add_argument('--analysis-config-b64', help='URL-safe base64 JSON analyseEvents settings')
 
     # Everything after this is passed through to the FairShip script
     parser.add_argument(
@@ -85,10 +100,21 @@ def main():
 
     # Safely quote passthrough args
     script_args = args.script_args[1:] if args.script_args[:1] == ["--"] else args.script_args
-    if bool(args.analysis_source) != bool(args.analysis_config):
-        parser.error('--analysis-source and --analysis-config must be supplied together')
+    config_text = args.analysis_config
+    if args.analysis_config_b64 is not None:
+        try:
+            config_text = base64.b64decode(args.analysis_config_b64, altchars=b'-_', validate=True).decode('utf-8')
+        except (ValueError, UnicodeError) as error:
+            parser.error(f'Invalid --analysis-config-b64: {error}')
+    if bool(args.analysis_source) != (config_text is not None):
+        parser.error('--analysis-source and one of --analysis-config or --analysis-config-b64 must be supplied together')
     if args.analysis_source:
-        prepare_analysis(args.analysis_source, json.loads(args.analysis_config))
+        try:
+            config = json.loads(config_text)
+        except ValueError as error:
+            parser.error(f'Invalid analysis JSON: {error}')
+        sources = args.analysis_source
+        prepare_analysis(sources[0] if len(sources) == 1 else sources, config)
     passthrough = " ".join(shlex.quote(a) for a in script_args)
 
     print(f"INFO: Executing: bash /cvmfs/ship-nightlies.cern.ch/pixi/pixi-cvmfs python3 {RUN_SCRIPT} {passthrough}")

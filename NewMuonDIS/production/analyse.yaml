@@ -1,9 +1,10 @@
 step: analyse
 tag: TRY2026
-production: 261009
+production: 261017
 # Outputs: output_dir/analysis/analysis_name/<source-hash>/[subjob]/analysis_evt*.tar.gz
 analysis_name: replay_gen_v1
-# input_dir defaults to the production root; one job per matching ROOT file.
+# input_dir defaults to the production root.
+files_per_job: 50  # Increase to analyse several ROOT files as one chain per job.
 n_jobs: -1
 n_subjobs: 1
 events_per_file: -1
@@ -12,6 +13,12 @@ analysis:
   type: disreplay_gen  # also disreplay_filter, disgen, disfilter
   save_plots: false   # render plots once in mergeAnalysis.py
   weight_factor: 3.6e-6
-  target_sum_weights: null
+  target_sum_weights: 6241572595.8004637
   failed_job_factor: 1.0
-# Optional: plot_axes and geometry_file inside analysis, as in analyseEvents.yaml.
+  # Shared geometry for every analysis input and job.
+  geometry_file: /eos/experiment/ship/user/ammagnan/MuonDIS/TRY2026/261017/sim_000e9149-15b3-4af4-97b0-727cd5ba0de0/1/0/geo_muonDis_cudaMu_TRY2026_evt12500_25000_evt0_250_disreplay_gen.root
+# Each axis specifies [minimum_cm, maximum_cm, number_of_bin_edges].
+  plot_axes:
+    x: [-500, 500, 500]
+    y: [-500, 500, 500]
+    z: [2000, 10000, 800]

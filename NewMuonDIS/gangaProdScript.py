@@ -2,6 +2,9 @@
 """Prepare one stage of a DIS production from YAML, optionally submitting with Ganga."""
 
 import argparse
+import base64
+from collections import Counter
+from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import json
@@ -20,6 +23,9 @@ IN_GANGA = all(name in globals() for name in ('config', 'Job', 'Executable', 'Fi
                                              'ArgSplitter', 'MassStorageFile', 'Condor', 'FileChecker'))
 # In that namespace __file__ belongs to GPI; Ganga puts this script in argv[0].
 SCRIPT_DIR = Path(sys.argv[0] if IN_GANGA else __file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from productionState import ProductionState, state_lock
 
 
 DATA_STEPS = ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter')
@@ -35,7 +41,11 @@ DEFAULTS = {
     'site': 'CERN',
     'max_runtime': 86000,
     'n_jobs': -1,  # Maximum new Ganga jobs after skipping outputs; -1 selects all.
+    'files_per_job': 1,  # Analysis only: consecutive inputs in one chain.
     'skip_existing': True,
+    'resubmit_incomplete': False,
+    'state_file': None,  # Optional persistent plan and Ganga submission history.
+    'retry_failed': False,
     'n_subjobs': None,
     'events_per_file': None,
     'events_per_subjob': None,
@@ -52,7 +62,7 @@ REPLAY_OPTIONS = {
 }
 STEP_DEFAULTS = {
     'analyse': {
-        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip',
+        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
         'executable': 'newMuonDIS/analyseEvents.py',
         'input_pattern': 'sim_*_disreplay_gen.root',
         'events_per_file': -1,
@@ -71,7 +81,7 @@ STEP_DEFAULTS = {
         },
     },
     'disfilter': {
-        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip',
+        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
         'executable': 'newMuonDIS/filterEvents.py',
         'input_pattern': '*_disgen.root',
         'events_per_file': -1,
@@ -83,14 +93,14 @@ STEP_DEFAULTS = {
         },
     },
     'disreplay_gen': {
-        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip',
+        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
         'executable': 'macro/run_simScript.py',
         'input_pattern': '*_disgen.root',
         'events_per_file': -1,
         'options': REPLAY_OPTIONS,
     },
     'disreplay_filter': {
-        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip',
+        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
         'executable': 'macro/run_simScript.py',
         'input_pattern': '*_disfilter.root',
         'events_per_file': -1,
@@ -116,8 +126,9 @@ def load_settings(filename):
     options.update(supplied.get('options', {}))
     settings.update(supplied)
     settings['options'] = options
-    if type(settings['skip_existing']) is not bool:
-        raise ValueError('skip_existing must be true or false')
+    for key in ('skip_existing', 'resubmit_incomplete', 'retry_failed'):
+        if type(settings[key]) is not bool:
+            raise ValueError(f'{key} must be true or false')
     if step == 'analyse':
         if not isinstance(settings['analysis'], dict):
             raise ValueError('analysis must be an analyseEvents settings mapping')
@@ -128,6 +139,11 @@ def load_settings(filename):
         reserved = {'production_path', 'first_entry', 'n_events', 'output_dir'} & analysis.keys()
         if reserved:
             raise ValueError(f'Use top-level input/output/range settings instead of analysis: {sorted(reserved)}')
+        geometry = analysis.get('geometry_file')
+        if geometry is not None:
+            if not isinstance(geometry, str) or not geometry:
+                raise ValueError('analysis.geometry_file must be a nonempty path or null')
+            analysis['geometry_file'] = str(Path(geometry).expanduser().resolve())
         settings['analysis'] = analysis
         name = settings['analysis_name']
         if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name):
@@ -151,6 +167,10 @@ def load_settings(filename):
     settings['output_dir'] = Path(output).expanduser().resolve()
     settings['input_dir'] = Path(settings['input_dir'] or settings['output_dir']).expanduser().resolve()
     settings['fs_install'] = str(Path(settings['fs_install']).expanduser().resolve())
+    if settings['state_file'] is not None:
+        if not isinstance(settings['state_file'], str) or not settings['state_file']:
+            raise ValueError('state_file must be a nonempty path or null')
+        settings['state_file'] = Path(settings['state_file']).expanduser().resolve()
     return settings
 
 
@@ -243,50 +263,103 @@ def output_names(step, chunk):
     return [chunk[-1]]
 
 
-def select_pending_jobs(settings, jobs, limit, summary):
+def inspect_output(path):
+    """Return a change-detection token, usability, and whether unlink is safe."""
+    def token(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None, False, True
+    state = (token(info),)
+    removable = stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return state + (None,), False, True
+        state += (token(info),)
+    return state, stat.S_ISREG(info.st_mode) and info.st_size > 0, removable
+
+
+def cleanup_incomplete_outputs(plan):
+    """Remove only planned file/link outputs, immediately before submission."""
+    records = plan.get('cleanup', [])
+    # Validate every output, including formerly missing files, before deleting any.
+    for record in records:
+        for path, expected in record.items():
+            state, _, removable = inspect_output(path)
+            if state != expected or not removable:
+                raise ValueError(f'Output changed since planning; rerun the preview: {path}')
+    for record in records:
+        for path, expected in record.items():
+            if expected is not None:
+                print(f'Removing incomplete-range output: {path}', flush=True)
+                path.unlink()
+
+
+def select_pending_jobs(settings, jobs, limit, summary, state=None):
     """Apply the new-job budget after checking each original range destination."""
     selected = []
     for job in jobs:
         if limit != -1 and len(selected) >= limit:
             break
         pending = []
+        cleanup = {}
+        checks = {}
+        tracking_checks = {}
+        completed = 0
         for index, chunk in enumerate(job['subjobs']):
             paths = [settings['output_dir'] / job['output_format'].format(sjid=index, fname=name)
                      for name in output_names(settings['step'], chunk)]
-            # lstat distinguishes absent outputs from broken links and I/O failures.
-            existing = []
-            usable = []
-            for path in paths:
-                try:
-                    info = path.lstat()
-                except FileNotFoundError:
-                    existing.append(False)
-                    usable.append(False)
-                else:
-                    existing.append(True)
-                    if stat.S_ISLNK(info.st_mode):
-                        try:
-                            info = path.stat()
-                        except FileNotFoundError:
-                            usable.append(False)
-                            continue
-                    usable.append(stat.S_ISREG(info.st_mode) and info.st_size > 0)
+            inspected = [inspect_output(path) for path in paths]
+            checks[index] = dict(zip(paths, (item[0] for item in inspected)))
+            existing = [token is not None for token, _, _ in inspected]
+            if state is not None:
+                status, ref = state.range_status(job['range_keys'][index])
+                tracking_checks[job['range_keys'][index]] = (status, ref)
+                if status == 'held' or (status in ('failed', 'killed') and not settings['retry_failed']):
+                    category = 'held' if status == 'held' else 'failed'
+                    summary[f'skipped_{category}_ranges'] += 1
+                    summary['warnings'].append(f'Ganga {ref}: {status}; skipping range for {job["source"]}.')
+                    continue
+                if (status == 'completed' and not all(usable for _, usable, _ in inspected)
+                        and not settings['resubmit_incomplete']):
+                    summary['skipped_incomplete_ranges'] += 1
+                    summary['warnings'].append(f'Ganga {ref}: completed with absent/empty/partial outputs; '
+                                               'use --resubmit-incomplete to retry this range.')
+                    continue
             if any(existing):
                 if not settings['skip_existing']:
                     raise ValueError(f'Output already exists: {paths[existing.index(True)]}')
-                if not all(usable):
-                    raise ValueError('Incomplete output set for '
-                                     f'{job["source"]}, original range {index}: '
-                                     + ', '.join(str(path) for path in paths)
-                                     + '. Check or move these outputs before retrying; nothing was overwritten.')
+                if not all(usable for _, usable, _ in inspected):
+                    retry = settings['resubmit_incomplete'] and all(
+                        removable for _, _, removable in inspected)
+                    action = 'eligible for cleanup and resubmission' if retry else 'skipping range'
+                    if settings['resubmit_incomplete'] and not retry:
+                        action += ' (contains a directory or special file; not deleting it)'
+                    summary['warnings'].append(
+                        f'Incomplete output set for {job["source"]}, original range {index}: '
+                        + ', '.join(str(path) for path in paths) + f'; {action}.')
+                    if retry:
+                        cleanup[index] = dict(zip(paths, (state for state, _, _ in inspected)))
+                        pending.append(index)
+                    else:
+                        summary['skipped_incomplete_ranges'] += 1
+                    continue
                 summary['skipped_ranges'] += 1
+                completed += 1
             else:
                 pending.append(index)
         if not pending:
-            summary['skipped_inputs'] += 1
+            if completed == len(job['subjobs']):
+                summary['skipped_inputs'] += len(job['sources'])
             continue
         if len(pending) == len(job['subjobs']):
-            selected.append(job)
+            selected.append(dict(job, cleanup=list(cleanup.values()), checks=list(checks.values()),
+                                 tracking_checks=tracking_checks))
             continue
         # Removing ArgSplitter entries renumbers sjid. Repair each missing range
         # as an unsplit job with the original physical destination instead.
@@ -295,24 +368,45 @@ def select_pending_jobs(settings, jobs, limit, summary):
                 break
             selected.append(dict(job, subjobs=[job['subjobs'][index]], split=False,
                                  output_format=job['output_format'].format(sjid=index, fname='{fname}'),
-                                 original_range=index))
+                                 original_range=index, cleanup=[cleanup[index]] if index in cleanup else [],
+                                 checks=[checks[index]],
+                                 **({'range_keys': [job['range_keys'][index]],
+                                     'tracking_checks': {job['range_keys'][index]:
+                                                         tracking_checks[job['range_keys'][index]]}}
+                                    if state is not None else {})))
     summary['selected_ranges'] = sum(len(job['subjobs']) for job in selected)
-    summary['selected_inputs'] = len({job['source'] for job in selected})
+    summary['selected_inputs'] = len({source for job in selected for source in job['sources']})
     summary['selected_jobs'] = len(selected)
     summary['requested_jobs'] = limit
+    summary['resubmitted_ranges'] = sum(len(job['cleanup']) for job in selected)
     return selected
 
 
-def plan_jobs(settings, test=False, summary=None):
+def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
     integer(settings, 'max_runtime', 1)
     limit = integer(settings, 'n_jobs', 0, allow_all=True)
+    files_per_job = integer(settings, 'files_per_job', 1)
+    if settings['step'] != 'analyse' and files_per_job != 1:
+        raise ValueError('files_per_job is only supported for step: analyse')
     if summary is None:
         summary = {}
-    summary.update(skipped_ranges=0, skipped_inputs=0)
+    summary.update(skipped_ranges=0, skipped_inputs=0, skipped_incomplete_ranges=0,
+                   skipped_missing_geometry_inputs=0, skipped_held_ranges=0,
+                   skipped_failed_ranges=0, warnings=[])
     if test and limit != 0:
         limit = 1
+    if test:
+        files_per_job = 1
     ranges = event_ranges(settings, test)
     options = executable_options(settings)
+    if settings['step'] == 'analyse' and settings['analysis']['type'].startswith('disreplay'):
+        geometry = settings['analysis'].get('geometry_file')
+        if geometry and not Path(geometry).is_file():
+            raise ValueError(f'Analysis geometry override is not an accessible file: {geometry}. '
+                             'Correct analysis.geometry_file or set it to null to use each input’s sibling geometry.')
+    saved = state.plans(settings) if state is not None else None
+    if saved is not None and not extend:
+        return select_pending_jobs(settings, saved, limit, summary, state)
     directory = settings['input_dir']
     output = settings['output_dir']
     step = settings['step']
@@ -344,17 +438,25 @@ def plan_jobs(settings, test=False, summary=None):
             if settings['analysis']['type'].startswith('disreplay') and not settings['analysis'].get('geometry_file'):
                 geometry = source.with_name('geo_' + source.name[4:])
                 if not geometry.is_file():
-                    raise ValueError(f'Missing replay geometry: {geometry}')
+                    summary['skipped_missing_geometry_inputs'] += 1
+                    summary['warnings'].append(f'Missing replay geometry: {geometry}; skipping input {source}.')
+                    continue
         sources.append(source)
-    if not sources:
+    if not sources and not summary['skipped_missing_geometry_inputs'] and not saved:
         raise ValueError(f'No matching ROOT files in {directory} ({settings["input_pattern"]})')
     files_per_directory = {}
     for source in sources:
         files_per_directory[source.parent] = files_per_directory.get(source.parent, 0) + 1
-    jobs = []
-    destinations = set()
+    jobs = saved or []
+    destinations = {output / plan['output_format'].format(sjid=index, fname=name)
+                    for plan in jobs for index, chunk in enumerate(plan['subjobs'])
+                    for name in output_names(step, chunk)}
+    known_sources = {source.resolve() for plan in jobs for source in plan['sources']}
+    sources = [source for source in sources if source.resolve() not in known_sources]
     generation_dirs = set()
-    for source in sources:
+    for offset in range(0, len(sources), files_per_job):
+        group = sources[offset:offset + files_per_job]
+        source = group[0]
         relative = source.relative_to(directory)
         folder = relative.parent
         if step == 'disgen':
@@ -367,17 +469,23 @@ def plan_jobs(settings, test=False, summary=None):
             # Preserve the production tree even if input_dir selects one run/subjob.
             folder = source.relative_to(output).parent
         if step == 'analyse':
-            # Stable across n_jobs and nested input selections; no dependency on Ganga IDs.
-            identity = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:20]
+            # Group before skipping outputs/limiting jobs, keeping resume destinations stable.
+            paths = [str(item.resolve()) for item in group]
+            identity_text = paths[0] if len(paths) == 1 else json.dumps(paths)
+            identity = hashlib.sha256(identity_text.encode()).hexdigest()[:20]
             folder = Path('analysis') / settings['analysis_name'] / identity
         split = len(ranges) > 1
         output_format = str(folder / '{sjid}' / '{fname}' if split else folder / '{fname}')
         args = ['--fs-install', settings['fs_install'], '--runfile', settings['executable'],
                 '--site', settings['site'], '--', '-f', str(source), *options]
         if step == 'analyse':
+            # Keep JSON quotes out of Ganga/Condor's command-line serialization.
+            analysis_config = base64.urlsafe_b64encode(
+                json.dumps(settings['analysis'], allow_nan=False).encode('utf-8')).decode('ascii')
+            source_args = [arg for item in group for arg in ('--analysis-source', str(item))]
             args = ['--fs-install', settings['fs_install'], '--runfile', settings['executable'],
-                    '--site', settings['site'], '--analysis-source', str(source),
-                    '--analysis-config', json.dumps(settings['analysis'], allow_nan=False),
+                    '--site', settings['site'], *source_args,
+                    '--analysis-config-b64', analysis_config,
                     '--', 'analysis-config.json']
         subjobs = []
         for index, (first, size) in enumerate(ranges):
@@ -405,12 +513,14 @@ def plan_jobs(settings, test=False, summary=None):
                     raise ValueError(f'Inputs map to the same output: {destination}')
                 destinations.add(destination)
             subjobs.append(chunk)
-        jobs.append({'source': source, 'args': args, 'subjobs': subjobs,
+        jobs.append({'source': source, 'sources': group, 'args': args, 'subjobs': subjobs,
                      'split': split, 'output_format': output_format})
-    return select_pending_jobs(settings, jobs, limit, summary)
+    if state is not None:
+        jobs = state.set_plans(settings, jobs, output_names)
+    return select_pending_jobs(settings, jobs, limit, summary, state)
 
 
-def prepare_jobs(settings, jobs, submit=False):
+def prepare_jobs(settings, jobs, submit=False, state=None):
     outdir = str(settings['output_dir']) + '/'
     if submit:
         os.makedirs(outdir, exist_ok=True)
@@ -439,11 +549,52 @@ def prepare_jobs(settings, jobs, submit=False):
         j.postprocessors.append(fc)
         execution = f'{len(plan["subjobs"])} subjobs' if plan['split'] else 'one unsplit job'
         j.comment = f'{settings["step"]}: {execution} from {plan["source"]}'
+        if len(plan['sources']) > 1:
+            j.comment += f' and {len(plan["sources"]) - 1} more inputs'
         if 'original_range' in plan:
             j.comment += f'; repair of original range {plan["original_range"]}'
-        print(f'Ganga job {j.id}: {plan["source"]} ({execution})', flush=True)
+        print(f'Ganga job {j.id}: {plan["source"]} ({len(plan["sources"])} input(s), {execution})', flush=True)
         if submit:
-            j.submit()
+            if state is None:
+                cleanup_incomplete_outputs(plan)
+                j.submit()
+                continue
+            state.refresh(state.registry, state.data['repository'])
+            for key, expected in plan['tracking_checks'].items():
+                if state.range_status(key) != expected:
+                    raise ValueError('Ganga status changed since planning; rerun the preview')
+            for source in plan['sources']:
+                if not source.is_file():
+                    raise ValueError(f'Planned input is no longer available: {source}')
+            for record in plan['checks']:
+                for path, expected in record.items():
+                    if inspect_output(path)[0] != expected:
+                        raise ValueError(f'Output changed since planning; rerun the preview: {path}')
+            attempt = state.reserve(j, plan)
+            try:
+                cleanup_incomplete_outputs(plan)
+            except BaseException:
+                attempt['phase'] = 'not_submitted'
+                state.save()
+                raise
+            attempt['phase'] = 'submitting'
+            state.save()
+            try:
+                j.submit()
+            except BaseException as error:
+                # A submit exception can happen after the backend accepted work.
+                attempt['phase'] = 'uncertain'
+                attempt['error'] = str(error)
+                state.save()
+                raise
+            attempt['phase'] = 'submitted'
+            state.save()
+
+
+def ganga_repository():
+    section = config['Configuration']
+    return dict(gangadir=str(Path(os.path.expandvars(section['gangadir'])).expanduser().resolve()),
+                user=section['user'], type=section['repositorytype'])
 
 
 def main():
@@ -452,37 +603,143 @@ def main():
     parser.add_argument('--test', action='store_true',
                         help='One unsplit job; 2 input muons for replay, 100 input entries otherwise')
     parser.add_argument('--submit', action='store_true', help='Submit prepared jobs (requires Ganga)')
+    parser.add_argument('--files-per-job', type=int,
+                        help='Analysis input files per job (overrides YAML; default 1)')
+    parser.add_argument('--n-jobs', type=int, help='Maximum new Ganga jobs in this batch (overrides YAML)')
+    parser.add_argument('--state-file', type=Path, help='Persistent production plan and Ganga history')
+    parser.add_argument('--retry-failed', action='store_true', default=None,
+                        help='Include tracked failed/killed ranges; requires a state file')
+    parser.add_argument('--status', action='store_true', help='Report tracked status without creating jobs')
+    parser.add_argument('--sync-state', action='store_true',
+                        help='Save current Ganga repository statuses without submitting')
+    parser.add_argument('--release-job', type=int, action='append', default=[],
+                        help='With --sync-state, release a missing/new tracked job after checking it is inactive')
+    parser.add_argument('--adopt-job', type=int, action='append', default=[],
+                        help='With --sync-state, register an existing Ganga master job (repeatable)')
+    parser.add_argument('--extend-plan', action='store_true',
+                        help='With --sync-state, append newly discovered inputs without regrouping saved work')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show every range command, output warning and cleanup path')
     existing = parser.add_mutually_exclusive_group()
     existing.add_argument('--skip-existing', dest='skip_existing', action='store_true', default=None,
-                          help='Skip complete output sets and fill n_jobs with new work (default)')
+                          help='Skip existing outputs and fill n_jobs with new work (default)')
     existing.add_argument('--no-skip-existing', dest='skip_existing', action='store_false',
                           help='Stop on any existing output instead of skipping it')
+    incomplete = parser.add_mutually_exclusive_group()
+    incomplete.add_argument('--resubmit-incomplete', dest='resubmit_incomplete', action='store_true',
+                            default=None, help='Delete selected incomplete output sets with --submit '
+                                               'and rerun those ranges (opt-in)')
+    incomplete.add_argument('--no-resubmit-incomplete', dest='resubmit_incomplete', action='store_false',
+                            help='Leave empty/partial outputs untouched and continue to later work (default)')
     args = parser.parse_args()
     try:
         settings = load_settings(args.yaml_file)
+        if args.files_per_job is not None:
+            settings['files_per_job'] = args.files_per_job
+        if args.n_jobs is not None:
+            settings['n_jobs'] = args.n_jobs
+        if args.state_file is not None:
+            settings['state_file'] = args.state_file.expanduser().resolve()
+        if args.retry_failed is not None:
+            settings['retry_failed'] = args.retry_failed
         if args.skip_existing is not None:
             settings['skip_existing'] = args.skip_existing
-        summary = {}
-        jobs = plan_jobs(settings, args.test, summary)
+        if args.resubmit_incomplete is not None:
+            settings['resubmit_incomplete'] = args.resubmit_incomplete
+        if (args.status or args.sync_state or settings['retry_failed']) and settings['state_file'] is None:
+            raise ValueError('--status, --sync-state and --retry-failed require --state-file or state_file in YAML')
+        if args.release_job and not args.sync_state:
+            raise ValueError('--release-job requires --sync-state')
+        if args.adopt_job and not args.sync_state:
+            raise ValueError('--adopt-job requires --sync-state')
+        if args.extend_plan and not args.sync_state:
+            raise ValueError('--extend-plan requires --sync-state')
+        if sum((args.submit, args.status, args.sync_state)) > 1:
+            raise ValueError('Choose only one of --submit, --status or --sync-state')
+        if (args.submit or args.sync_state) and not IN_GANGA:
+            raise ValueError('Run with ./gangaSubmit.sh CONFIG.yaml for submission or state synchronization')
+        path = settings['state_file']
+        writing = args.submit or args.sync_state
+        with state_lock(path) if path is not None and writing else nullcontext():
+            state = ProductionState(path, settings, args.test) if path is not None else None
+            if state is not None and IN_GANGA:
+                state.refresh(globals()['jobs'], ganga_repository())
+            if state is not None:
+                for job_id in args.release_job:
+                    state.release(job_id)
+            run_production(settings, args, state)
     except (OSError, ValueError, TypeError, yaml.YAMLError) as error:
         parser.error(str(error))
-    if args.submit and not IN_GANGA:
-        parser.error('Run with ./gangaSubmit.sh CONFIG.yaml --submit')
+
+
+def run_production(settings, args, state=None):
+    summary = {}
+    jobs = plan_jobs(settings, args.test, summary, state, extend=args.extend_plan)
+    if args.adopt_job:
+        state.adopt(globals()['jobs'], args.adopt_job, settings)
+        state.refresh(globals()['jobs'], ganga_repository())
+        jobs = plan_jobs(settings, args.test, summary, state)
+    if state is not None and (args.submit or args.sync_state):
+        state.save()
     execution = f'{summary["selected_ranges"]} executable ranges from {summary["selected_inputs"]} inputs'
     print(f'{settings["step"]}: {len(jobs)} new Ganga jobs, {execution} '
           f'({"submit" if args.submit else "prepare only; use --submit to submit"})')
-    print(f'Skipped while filling budget: {summary["skipped_inputs"]} complete inputs, '
-          f'{summary["skipped_ranges"]} existing ranges.')
+    print(f'Skipped ranges: {summary["skipped_ranges"]} complete file sets, '
+          f'{summary["skipped_incomplete_ranges"]} empty/partial sets left untouched.')
+    if state is not None:
+        print(f'State: {state.path} ({"current Ganga repository" if state.live else "saved snapshot"}).')
+        print('Tracked ranges: ' + ', '.join(f'{count} {status}' for status, count in sorted(state.counts().items())))
+        print(f'Skipped tracked ranges: {summary["skipped_held_ranges"]} active/unknown, '
+              f'{summary["skipped_failed_ranges"]} failed/killed (--retry-failed to include).')
+        if args.verbose:
+            for attempt in state.data['attempts']:
+                print(f'  Attempt {attempt["job_id"]}: {attempt["phase"]}, '
+                      + ', '.join(f'{count} {status}' for status, count in
+                                  sorted(Counter(attempt['statuses'].values()).items())))
+                if attempt.get('refresh_error'):
+                    print(f'    Status lookup: {attempt["refresh_error"]}')
+    if summary['skipped_missing_geometry_inputs']:
+        print(f'Skipped analysis inputs with missing replay geometry: '
+              f'{summary["skipped_missing_geometry_inputs"]}.')
+    if summary['resubmitted_ranges']:
+        cleanup_files = sum(expected is not None for plan in jobs
+                            for record in plan['cleanup'] for expected in record.values())
+        print(f'Cleanup on submission: {cleanup_files} files across '
+              f'{summary["resubmitted_ranges"]} ranges (--resubmit-incomplete enabled).')
+    if args.verbose:
+        for warning in summary['warnings']:
+            print(f'WARNING: {warning}')
     if summary['requested_jobs'] != -1 and len(jobs) < summary['requested_jobs']:
         print(f'Only {len(jobs)} of {summary["requested_jobs"]} requested jobs are available; '
-              'no more pending work in this selection.')
+              'no more eligible work in this selection.')
+    print(f'Input directory: {settings["input_dir"]}')
     print(f'Output directory: {settings["output_dir"]}')
-    for plan in jobs:
-        print(f'{plan["source"]} -> {settings["output_dir"]}/{plan["output_format"]}')
-        for chunk in plan['subjobs']:
-            print('  ' + shlex.join(['wn_script_pixi.py', *plan['args'], *chunk]))
-    if IN_GANGA and jobs:
-        prepare_jobs(settings, jobs, args.submit)
+    for index, plan in enumerate(jobs, 1):
+        first = int(plan['subjobs'][0][1])
+        last_start, last_size = map(int, (plan['subjobs'][-1][1], plan['subjobs'][-1][3]))
+        stop = 'EOF' if last_size == -1 else str(last_start + last_size)
+        ranges = (f'original range {plan["original_range"]}' if 'original_range' in plan
+                  else f'{len(plan["subjobs"])} range(s)')
+        source = plan['source'].relative_to(settings['input_dir'])
+        if len(plan['sources']) > 1:
+            source = f'{source} (+{len(plan["sources"]) - 1} more inputs)'
+        print(f'  {index}. {source} | {ranges}, entries [{first}, {stop}) '
+              f'-> {plan["output_format"]}')
+        if args.verbose:
+            for record in plan['cleanup']:
+                for path, expected in record.items():
+                    if expected is not None:
+                        print(f'  Cleanup on submission: {path}')
+            for chunk in plan['subjobs']:
+                print('  ' + shlex.join(['wn_script_pixi.py', *plan['args'], *chunk]))
+    if not args.verbose:
+        print('Use --verbose for full commands, warnings and cleanup paths.')
+    if args.status or args.sync_state:
+        return
+    if IN_GANGA and jobs and (state is None or args.submit):
+        prepare_jobs(settings, jobs, args.submit, state)
+    elif jobs and state is not None:
+        print('Tracked preview only; use ganga with --submit to submit this batch.')
     elif jobs:
         print('Preview only outside Ganga; use ganga to create Job objects.')
 

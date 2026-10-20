@@ -31,6 +31,8 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
+from jobTiming import print_job_timing, read_job_timing
+
 
 WDIS_SCALE = 0.006 * 1e-27 * 6.02214076e23
 MATERIALS = ('MS', 'UBT', 'SBTsens', 'SBTfr', 'SSTsens', 'SSTfr', 'HE', 'AIR',
@@ -454,6 +456,7 @@ def main():
     job_problems = Counter()
     problems = []
     results = []
+    timings = []
     excluded_outputs = []
     included_outputs = set()
     excluded_without_output = 0
@@ -479,7 +482,8 @@ def main():
                 problems.append(f'{label}: unreadable output locations ({error})')
             output = outputs[0] if len(outputs) == 1 else None
             try:
-                log_status, log_result = parse_stdout(logfile.read_text(errors='replace'), output)
+                log_text = logfile.read_text(errors='replace')
+                log_status, log_result = parse_stdout(log_text, output)
             except FileNotFoundError:
                 log_status, log_result = 'missing stdout', None
             except OSError as error:
@@ -501,17 +505,19 @@ def main():
                 # diagnostics in the detailed problems list below.
                 status = log_status if log_result is None else root_status
                 statuses[status] += 1
-                if log_result is None:
+                if log_result is None and log_status != 'missing stdout':
                     problems.append(f'{label}: {log_status}')
                 if not outputs:
                     excluded_without_output += 1
-                    problems.append(f'{label}: no recorded ROOT output path for rm')
+                    if log_status != 'missing stdout':
+                        problems.append(f'{label}: no recorded ROOT output path for rm')
                 excluded_outputs.extend(outputs)
                 continue
             statuses['successful'] += 1
             if args.check_root or args.metadata:
                 log_result.update(root_result)
             results.append(log_result)
+            timings.append(read_job_timing(logfile, log_text))
             included_outputs.add(eos_path(output) or output)
 
     print(f'Jobs {args.first_job}–{args.first_job + args.num_jobs - 1}')
@@ -570,6 +576,7 @@ def main():
     if results:
         print_path_statistics(results)
         print_extra_statistics(results)
+        print_job_timing(timings)
         if args.metadata:
             try:
                 print_normalization_statistics(results)
@@ -597,7 +604,7 @@ def main():
     rm_command.chmod(0o755)
     print(f'Wrote {len(removal_paths)} excluded-output deletion command(s) to '
           f'{rm_command}')
-    if problems:
+    if problems or statuses['missing stdout']:
         return 1
     return 0
 

@@ -19,6 +19,7 @@ import re
 import sys
 
 from checkPrepareEventsOutputs import NUMBER, print_stats, subjob_logs
+from jobTiming import print_job_timing, read_job_timing
 
 
 HIT_COLLECTIONS = ('UpstreamTaggerPoint', 'vetoPoint', 'strawtubesPoint', 'TimeDetPoint')
@@ -89,6 +90,7 @@ def main():
     job_problems = Counter()
     problems = []
     results = []
+    timings = []
     discovered_subjobs = 0
     for job_id in range(args.first_job, args.first_job + args.num_jobs):
         job_dir = base / str(job_id)
@@ -109,7 +111,8 @@ def main():
         discovered_subjobs += len(logs)
         for subjob_id, logfile in logs:
             try:
-                status, result = parse_stdout(logfile.read_text(errors='replace'))
+                log_text = logfile.read_text(errors='replace')
+                status, result = parse_stdout(log_text)
             except FileNotFoundError:
                 status, result = 'missing stdout', None
             except OSError as error:
@@ -119,6 +122,7 @@ def main():
                 problems.append(f'{job_id}/{subjob_id}: {status}')
             else:
                 results.append(result)
+                timings.append(read_job_timing(logfile, log_text))
 
     print(f'Jobs {args.first_job}–{args.first_job + args.num_jobs - 1}')
     print(f'Subjobs discovered: {discovered_subjobs}')
@@ -151,6 +155,7 @@ def main():
         cpu_time = sum(result['cpu_time'] for result in results)
         ratio = f'{100 * cpu_time / real_time:.2f}%' if real_time else 'undefined'
         print(f'Simulation CPU / real time (ratio of totals): {ratio}')
+        print_job_timing(timings)
     if problems:
         print('\nJobs/subjobs requiring attention:')
         print('\n'.join(problems))

@@ -48,7 +48,11 @@ Each YAML contains exactly one `step`. All other settings have defaults:
 | input_dir | Step 1 simulation directory; later stages default to output_dir |
 | input_pattern | Recursive filename glob, as in the table above |
 | n_jobs | Maximum new Ganga master jobs after skipping existing outputs; -1 selects all pending work, 0 selects none |
+| files_per_job | Analysis only: positive number of input files per job, default 1; CLI override: --files-per-job |
 | skip_existing | Skip complete output sets, default true; false restores the stop-on-existing-output behavior |
+| resubmit_incomplete | Default false: preserve empty/partial outputs and skip their ranges. True opts into cleanup and resubmission |
+| state_file | Optional JSON manifest path for persistent plans, Ganga IDs and attempt history; default null (file-based mode) |
+| retry_failed | With state_file, include tracked failed/killed ranges; default false |
 | n_subjobs | Optional number of ranges per input file; 1 creates an unsplit job |
 | events_per_file | Entry span used to plan splits, or unsplit entry limit; Step 1: 250000, others: -1 (all remaining) |
 | events_per_subjob | Optional positive chunk size; Step 1 defaults to 25000 when n_subjobs is absent |
@@ -154,9 +158,9 @@ gangaScript.py outputs named `muonDis_cudaMu_<tag>_evt<start>_<end>.root`, witho
 renaming them. For other legacy names, explicitly set an appropriate
 `input_pattern`, such as `muonDis_*.root`. Collision checks cover all discovered
 inputs before applying n_jobs, so the layout does not depend on job limits.
-Complete existing output sets are skipped before applying `n_jobs`, so repeated
-invocations advance through the remaining work. Incomplete output sets cause an
-error before submission. See the batch-production behavior below.
+Existing outputs, including empty or partial sets, are skipped before applying
+`n_jobs`, so repeated invocations advance through the remaining work. Cleanup
+and resubmission require explicit opt-in. See the batch-production behavior below.
 
 ## Analysis jobs and merging
 
@@ -172,15 +176,45 @@ python3 gangaProdScript.py production/analyse.yaml --test
 ./gangaSubmit.sh production/analyse.yaml --submit
 ```
 
-Each selected event file creates one job. The worker stages links to just that
-file and its replay geometry, so the analysis cannot accidentally process other
-files in the same upstream directory. Geometry is required beside each replay
-input unless `analysis.geometry_file` supplies an absolute override. `run.json`
+By default, each selected event file creates one job. Set `files_per_job` to a
+positive integer to group consecutive files from the sorted input selection into
+one analysis chain; the last job may contain fewer files. For example:
+
+```yaml
+files_per_job: 10
+n_subjobs: 1
+events_per_file: -1
+first_event: 0
+```
+
+This processes all entries from up to ten files per job. Alternatively, pass
+`--files-per-job 10` to `gangaProdScript.py` or `gangaSubmit.sh`.
+`n_jobs` still limits Ganga master jobs. Groups are formed before checking
+existing outputs and applying that limit, so repeated submissions with the same
+input selection keep the same groups.
+
+The worker stages links to only the selected files and their replay geometries,
+using separate directories for files with identical names. Geometry is required beside each replay
+input unless `analysis.geometry_file` supplies an absolute override. Inputs with
+missing geometry are skipped without consuming the job budget; the preview
+reports their count and `--verbose` lists their paths. If all matching inputs
+lack geometry, no jobs are prepared. `run.json`
 records the resolved source paths, ROOT UUIDs, processed ranges and analysis
-settings. `events_per_file` and `events_per_subjob` count analysis input entries
-(simulated events for replay), and the last split reads to EOF. `--test` reads
-100 entries from one file in an unsplit job. Analysis of `disgen` also discovers
+settings. With grouping, `first_event`, `events_per_file`, `events_per_subjob` and
+`n_subjobs` apply to the combined chain, not separately to each file.
+Entry counts refer to analysis input entries (simulated events for replay),
+and the last split reads to the end of the chain. `--test` always reads
+100 entries from one file in an unsplit job, ignoring `files_per_job`.
+Analysis of `disgen` also discovers
 the legacy `muonDis_cudaMu_*_evtSTART_END.root` names.
+
+Leave `analysis.geometry_file` unset or use `null` to select each replay input's
+matching `geo_*.root`. An explicit override applies to **every** input and
+prevents that automatic selection. Override paths are expanded and resolved
+relative to the launcher's working directory, then checked during planning and
+again on the worker. A missing override is an error; it does not silently fall
+back to a different geometry. After changing this setting, create a fresh
+Ganga job: an existing job retains the configuration encoded in its arguments.
 
 Outputs use an independent top-level directory under the production root:
 
@@ -188,9 +222,13 @@ Outputs use an independent top-level directory under the production root:
 analysis/<analysis_name>/<source-path-hash>/[subjob-id]/analysis_evtSTART_END.tar.gz
 ```
 
-The 20-character hash identifies the absolute source path and remains stable
-when limiting jobs or selecting a nested input directory. Choose a new
-`analysis_name` when changing selections, weights or splitting. Existing nonempty
+The 20-character hash identifies the ordered absolute source paths in a group
+and remains stable when limiting jobs. Single-file jobs retain their original
+hash and remain stable when selecting a nested input directory. For grouped
+jobs, changing the input selection (including adding files or fixing missing
+geometry) can change group boundaries. Keep the selection fixed when resuming,
+and choose a new `analysis_name` when changing selections, weights, grouping or
+splitting. Existing nonempty
 archives are skipped before applying the job limit. Each archive contains the **complete**
 analysis directory: `run.json`, histogram archive, CSV tables, pair details and
 all nested plots. The worker marks completion only after packaging succeeds;
@@ -265,11 +303,18 @@ python3 gangaProdScript.py production/disgen.yaml
 ```
 
 `skip_existing: true` is the default. For each original input/range, the planner
-checks the exact expected output paths. A range is skipped only when every
-expected file is a nonempty regular file (or a link to one). Replay requires
-all three `sim_`, `params_`, and `geo_` ROOT files; analysis requires its complete
-directory archive. This is a file-presence check, not content validation: use
-the appropriate check script to identify corrupt or failed outputs.
+checks the exact expected output paths. With the default
+`resubmit_incomplete: false`, a range with any existing output is left untouched,
+including empty or partial output sets. Empty outputs can be normal when the
+configured split extends beyond the available input entries (for example, a
+12,500-entry span applied to a file containing only 10,000 entries). The summary
+counts complete file sets separately from empty/partial sets without assuming
+that the latter indicate failures.
+
+Replay checks the expected `sim_`, `params_`, and `geo_` ROOT files; analysis
+checks its directory archive. This is a file-presence check, not content
+validation. Ranges with no output files at all remain eligible: the planner does
+not open ROOT inputs to determine whether those ranges are beyond EOF.
 
 Fully completed inputs do not consume `n_jobs`. For example, with `n_jobs: 40`,
 if the first 40 inputs already have their outputs, the next invocation prepares
@@ -287,16 +332,184 @@ new split jobs fills a batch of 40 master jobs; it need not contain the same
 number of executable ranges as the previous batch. Repair logs are in the new
 master job's `output/stdout`; its comment records the original range index.
 
-An incomplete replay set, empty file, directory in place of a file, or broken
-link stops planning before any submission. Check or move those outputs before
-retrying; the launcher does not overwrite them. Set `skip_existing: false` or
-pass `--no-skip-existing` to reject all existing outputs, including complete
-sets. `--skip-existing` overrides a YAML setting of false.
+Cleanup and resubmission are opt-in: pass `--resubmit-incomplete` or set
+`resubmit_incomplete: true` in YAML. When an expected output set is partial, contains an
+empty file or has a broken link, its range becomes eligible for resubmission.
+For a selected incomplete replay range, all surviving files in its expected
+`sim_`, `params_`, `geo_` set are removed and the full range is regenerated.
+Completely absent ranges are submitted normally; complete sets remain skipped.
 
-Output discovery does not track queued/running Ganga jobs. Wait for a batch to
-finish before rerunning the same selection, and use Ganga's existing job records
-to resubmit failed jobs that are still registered. Use a new production directory
-(or `analysis_name` for analysis) when changing settings: output presence alone
-does not establish that geometry, cuts or weights match the current YAML. For
-concurrent or more automated campaigns, a saved manifest of source, range,
-settings, Ganga IDs and validated completion would provide stronger bookkeeping.
+Deletion happens **only with `--submit`**, immediately before submitting the
+corresponding new Ganga job. Previewing, including inside Ganga, reports the
+number of files selected for cleanup and changes no outputs. Add `--verbose`
+to list every planned deletion. Cleanup applies only to selected
+ranges within the `n_jobs` budget, preserves unrelated files and complete
+sibling ranges, and unlinks symlinks without deleting their targets. It rechecks
+all files in the affected sets before deleting any; if an output appeared or
+changed after planning, submission stops and requires a fresh plan. Directories
+or special files occupying expected output paths are warned about and skipped,
+never recursively removed.
+
+The default preview prints totals, the input/output roots once, and one line per
+planned job showing its relative input path, range count, entry span and output
+layout. Per-range warnings and executable commands are hidden unless `--verbose`
+(or `-v`) is given. Explicit cleanup requests remain visible as a file/range
+count even in the concise preview.
+
+```bash
+# Concise read-only preview; existing outputs are preserved by default.
+python3 gangaProdScript.py production/disreplay_gen.yaml
+# Full commands, per-range warnings, and any planned cleanup paths.
+python3 gangaProdScript.py production/disreplay_gen.yaml --verbose
+# Submit missing work, leaving all existing output sets untouched.
+./gangaSubmit.sh production/disreplay_gen.yaml --submit
+# Explicitly opt into removing selected incomplete sets and regenerating them.
+./gangaSubmit.sh production/disreplay_gen.yaml --resubmit-incomplete --submit
+```
+
+`--no-resubmit-incomplete` explicitly disables cleanup, including when YAML
+enables it. With neither CLI flag supplied, YAML is used and defaults to false.
+
+`skip_existing: false` or `--no-skip-existing` remains an explicit strict mode:
+it rejects any existing output before submission, even if resubmission is enabled.
+`--skip-existing` restores normal skipping/resubmission behavior.
+
+Without `state_file`, output discovery does not track queued/running Ganga jobs.
+Wait for a batch to finish before rerunning the same selection, or enable the
+persistent tracking described below.
+
+## Persistent production tracking
+
+Set a separate `state_file` for each stage/analysis campaign, on AFS or local
+storage, and use that same file for every batch. Relative paths are interpreted
+from the launcher's working directory, like other top-level paths.
+
+```yaml
+state_file: /path/to/production-state/disreplay_gen.json
+n_jobs: 40
+```
+
+Alternatively pass `--state-file /path/to/production-state/disreplay_gen.json`.
+The first `--submit` or `--sync-state` saves the **whole discovered plan**, even
+when `n_jobs` selects only a small batch. The manifest records the configuration,
+input groups, entry ranges, output destinations, Ganga repository identity,
+master/subjob IDs, status snapshots and every submission attempt. It contains
+paths and bookkeeping, not event data or credentials.
+
+```bash
+# Read-only preview. Outside Ganga this uses the saved status snapshot.
+python3 gangaProdScript.py production/disreplay_gen.yaml --status
+
+# Create the manifest or save the current Ganga repository statuses; no submission.
+./gangaSubmit.sh production/disreplay_gen.yaml --sync-state
+
+# Submit the next 40 jobs. Repeat while previous batches are still running.
+./gangaSubmit.sh production/disreplay_gen.yaml --n-jobs 40 --submit
+
+# Examine current Ganga repository statuses and individual attempts.
+./gangaSubmit.sh production/disreplay_gen.yaml --status --verbose
+
+# Include failed/killed ranges as well as never-submitted work.
+./gangaSubmit.sh production/disreplay_gen.yaml --retry-failed --n-jobs 20 --submit
+
+# Also allow cleanup/retry of empty or partial output sets.
+./gangaSubmit.sh production/disreplay_gen.yaml --retry-failed --resubmit-incomplete --submit
+```
+
+The batch budget is applied after checking tracked status and existing outputs.
+Retries create new Ganga jobs, preserve the original output destinations and
+retain the old attempt in the manifest. A failed subjob can be retried while
+its siblings remain running. `--n-jobs` overrides YAML for this invocation;
+resource settings (`max_runtime`, `site`) and retry policies may also change
+between batches.
+
+| Tracked range | Default action |
+| --- | --- |
+| Never submitted | Apply the usual existing-output checks, then submit if eligible |
+| Submitted, running, completing, new, or unknown | Hold it, even if outputs are absent or empty |
+| Failed/killed | Hold until `--retry-failed`; complete output sets are still skipped, and partial/empty sets additionally require `--resubmit-incomplete` |
+| Completed with nonempty expected files | Skip |
+| Completed with absent, empty or partial outputs | Preserve until `--resubmit-incomplete`, including jobs that legitimately produced no output |
+| Missing Ganga job or mismatched job identity | Hold for inspection; never infer failure from missing files |
+
+These are [Ganga repository statuses](https://ganga.readthedocs.io/en/latest/API/ganga.GangaCore.GPIDev.Lib.Job.Job.html),
+not a direct HTCondor query. Keep Ganga's
+normal monitoring active (for example in an interactive Ganga session) so it
+updates backend status and runs postprocessing. Script-mode Ganga may have
+monitoring disabled. `--sync-state` copies the statuses currently known to Ganga;
+it does not wait for or trigger a backend monitoring cycle. A stale active
+status holds work rather than risking a duplicate submission. Plain-Python
+`--status` is explicitly labelled as a saved snapshot.
+
+File completeness still means nonempty expected files, not ROOT/archive content
+validation. Continue using the stage-specific check scripts. The manifest
+compares YAML settings, not the contents of executable, geometry or input files;
+use a new output namespace and state file when changing physics settings or
+replacing those files.
+
+### Adding inputs and preserving groups
+
+Normal reruns use the saved plan without rediscovering or regrouping inputs.
+This keeps analysis groups and range destinations stable if upstream files
+arrive later, or a missing replay geometry is repaired. Append newly eligible
+inputs explicitly:
+
+```bash
+./gangaSubmit.sh production/analyse.yaml --sync-state --extend-plan
+./gangaSubmit.sh production/analyse.yaml --n-jobs 20 --submit
+```
+
+Existing groups, including a short final group, stay unchanged; new files form
+new groups. Saved inputs that disappear remain in the plan, and submission
+stops if a selected input is unavailable. Changing selections, splitting,
+`files_per_job`, executable options or analysis settings is rejected for an
+existing manifest. Use a separate state/output namespace for that change.
+Use a separate state file for `--test` runs as well.
+
+### Registering existing jobs
+
+For an ongoing production, register the previously submitted Ganga master jobs
+before launching another tracked batch:
+
+```bash
+./gangaSubmit.sh production/disreplay_gen.yaml --sync-state \
+    --adopt-job 1200 --adopt-job 1201 --adopt-job 1202
+```
+
+Adoption compares full worker arguments, splitting and output layout against
+the saved plan, and rejects mismatches. It supports original split jobs and
+individual range-repair jobs. It adds an identity marker to the job comment and
+records the attempt; it does not submit or resubmit the job. Use the original
+production YAML/output root: older jobs used a global MassStorage upload root,
+which cannot be recovered from their relative output layout alone. Existing
+nonempty outputs need no adoption, but **all outstanding jobs** for this
+production must be registered to protect work with no output yet.
+
+### Interrupted submissions and recovery
+
+The launcher takes an exclusive directory lock beside the manifest throughout
+planning, cleanup and submission, and writes JSON by atomic replacement. Two
+launchers using the same state file cannot claim the same work. The reservation
+and Ganga job ID are saved **before** deleting incomplete outputs or calling
+`submit()`. If submission raises an exception after backend acceptance, the
+attempt remains held until its Ganga status can be resolved.
+
+A missing job or a job left in `new` can be released explicitly after checking
+that it has no live backend work:
+
+```bash
+./gangaSubmit.sh production/disreplay_gen.yaml --sync-state --release-job 1200
+./gangaSubmit.sh production/disreplay_gen.yaml --retry-failed --submit
+```
+
+Release is refused for running/submitted jobs and unknown/mismatched identities;
+it does not kill or remove Ganga jobs. For failed/killed jobs use
+`--retry-failed` directly. If an old attempt is manually resubmitted later,
+its active status blocks new attempts too.
+
+If a launcher is killed without releasing its lock, inspect
+`STATE.json.lock/owner.json` and remove that lock directory only after the
+recorded launcher has stopped. Do not delete or edit the manifest to force a
+retry. Tracking protection requires every launcher for a campaign to share
+the same state file; independent manifests or legacy file-only submissions
+cannot coordinate with it.
