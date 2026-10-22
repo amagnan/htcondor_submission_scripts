@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 from checkPrepareEventsOutputs import eos_path, print_stats, subjob_logs
 
@@ -44,14 +45,18 @@ def read_analysis_archive(filename):
             raise ValueError('Invalid or oversized run.json')
         with archive.extractfile(manifest_member) as stream:
             manifest = json.load(stream)
-        if manifest.get('output_version') != 3:
-            raise ValueError('Missing or unsupported analysis output version')
+        version = manifest.get('output_version')
+        if version not in (3, 4, 5):
+            raise ValueError(f'Unsupported analysis output_version {version!r} in {root}/run.json; '
+                             'expected 3, 4 or 5')
         kind = manifest['analysis_signature']['type']
         if kind not in ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter'):
             raise ValueError('Unknown analysis type')
         required = ['run.json', 'histograms.npz', 'histogram_flows.csv', 'normalization.csv']
         required += (['cutflow.csv', 'pair_cutflow.csv', 'pair_composition_cutflow.csv', 'pairs.csv']
                      if kind.startswith('disreplay') else ['vertex_counts.csv'])
+        if version >= 4 and kind.startswith('disreplay'):
+            required += ['tagger_cutflow.csv', 'tagger_tracks.csv']
         for name in required:
             member = archive.getmember(root + '/' + name)
             if not member.isfile() or member.size == 0:
@@ -75,7 +80,8 @@ def validate_analysis_sources(results):
     intervals, identities, sizes = {}, {}, {}
     for result in results:
         manifest = result['manifest']
-        if any(manifest[key] != reference[key] for key in ('analysis_signature', 'weight_definition')):
+        if any(manifest[key] != reference[key]
+               for key in ('output_version', 'analysis_signature', 'weight_definition')):
             raise ValueError('Incompatible analysis settings/code; check and merge each configuration separately')
         processed = 0
         for source in manifest['source_ranges']:
@@ -113,22 +119,26 @@ def merge_analysis(results, args):
         raise ValueError(f'Merge output must be new or empty: {destination}')
     if destination == unpack or unpack in destination.parents or destination in unpack.parents:
         raise ValueError('Merge output and unpack directory must be separate')
-    if unpack.exists():
-        raise ValueError(f'Unpack directory already exists; choose a new --unpack-dir: {unpack}')
-    unpack.mkdir(parents=True)
+    unpack.mkdir(parents=True, exist_ok=True)
+    if any(unpack.iterdir()):
+        unpack = Path(tempfile.mkdtemp(prefix='merge_', dir=unpack))
+    print(f'Retaining merge inputs in {unpack}', flush=True)
     inputs = []
     for index, result in enumerate(results):
         folder = unpack / str(index)
         folder.mkdir()
-        with tarfile.open(result['archive'], 'r:gz') as archive:
+        with tarfile.open(result['archive'], 'r|gz') as archive:
             # read_analysis_archive has rejected traversal, links and special files.
             # Copy regular files explicitly (also works with older Python tarfile).
-            for member in archive.getmembers():
+            for member in archive:
                 parts = Path(member.name).parts
                 if (not parts or Path(member.name).is_absolute() or '..' in parts
                         or parts[0] != result['directory']
                         or not (member.isfile() or member.isdir())):
                     raise ValueError(f'Unsafe archive member: {member.name}')
+                if args.skip_tagger_tracks and parts == (result['directory'], 'tagger_tracks.csv'):
+                    print(f'Skipping {member.name} ({member.size / 1024**2:.1f} MiB unpacked)', flush=True)
+                    continue
                 target = folder / member.name
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
@@ -136,10 +146,18 @@ def merge_analysis(results, args):
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with archive.extractfile(member) as source, target.open('xb') as output:
                         shutil.copyfileobj(source, output)
-        inputs.append(str(folder / result['directory']))
+        directory = folder / result['directory']
+        if args.skip_tagger_tracks and result['manifest']['analysis_signature']['type'].startswith('disreplay'):
+            manifest_path = directory / 'run.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['omitted_files'] = sorted(set(manifest.get('omitted_files', [])) | {'tagger_tracks.csv'})
+            manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+        inputs.append(str(directory))
     command = [sys.executable, str(args.merger), *inputs, '-o', str(destination)]
     if args.no_plots:
         command.append('--no-plots')
+    if args.skip_tagger_tracks:
+        command.append('--skip-tagger-tracks')
     print(f'Running merger on {len(inputs)} validated outputs', flush=True)
     subprocess.run(command, check=True)
 
@@ -216,15 +234,19 @@ def main():
     parser.add_argument('--num-jobs', type=int, required=True)
     parser.add_argument('--merge-output', type=Path, help='Run mergeAnalysis.py into this new/empty directory')
     parser.add_argument('--unpack-dir', type=Path,
-                        help='New directory for retained merge inputs (default: MERGE_OUTPUT_inputs)')
+                        help='Directory for retained merge inputs; creates a unique subdirectory if nonempty '
+                             '(default: MERGE_OUTPUT_inputs)')
     parser.add_argument('--merger', type=Path,
-                        default=Path('/afs/cern.ch/work/a/ammagnan/FairShip/newMuonDIS/mergeAnalysis.py'))
+                        default=Path('/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs/newMuonDIS/mergeAnalysis.py'))
     parser.add_argument('--no-plots', action='store_true', help='Skip rendering merged plots')
+    parser.add_argument('--skip-tagger-tracks', action='store_true',
+                        help='Skip extracting and merging tagger_tracks.csv; retain original archives '
+                             'and merge all histograms and summary tables')
     parser.add_argument('--merge-successful', action='store_true',
                         help='Explicitly allow a partial merge of valid jobs')
     args = parser.parse_args()
-    if not args.merge_output and (args.unpack_dir or args.no_plots or args.merge_successful):
-        parser.error('--unpack-dir, --no-plots and --merge-successful require --merge-output')
+    if not args.merge_output and (args.unpack_dir or args.no_plots or args.skip_tagger_tracks or args.merge_successful):
+        parser.error('--unpack-dir, --no-plots, --skip-tagger-tracks and --merge-successful require --merge-output')
     base = args.path.expanduser()
     if not base.is_dir():
         parser.error(f'Not a directory: {base}')

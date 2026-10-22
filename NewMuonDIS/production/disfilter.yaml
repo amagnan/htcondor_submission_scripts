@@ -14,6 +14,7 @@ first_event: 0
 options:
   --filter-option: 1
   --pythia-decays: true
+  --pythia-decay-seed: 12345  # Fixed seed; 0 uses a time-based seed.
   --geoFile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
   --field-map: /afs/cern.ch/work/a/ammagnan/FairShip/files/2026_07_02_MainSpectrometerField_V21_2455.root
   --muon-shield-field-map: /afs/cern.ch/work/a/ammagnan/FairShip/files/TRY_2026.root

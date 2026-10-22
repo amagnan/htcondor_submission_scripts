@@ -16,4 +16,4 @@ options:
   --strawDesign: 10
   --noSND: true
   --debug: 0
-  --seed: 0
+  --seed: 12345  # Fixed seed; 0 uses a time-based seed.

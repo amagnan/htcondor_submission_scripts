@@ -454,6 +454,7 @@ def main():
         parser.error('--first-job must be nonnegative and --num-jobs must be positive')
     statuses = Counter()
     job_problems = Counter()
+    missing_stdout_subjobs = []
     problems = []
     results = []
     timings = []
@@ -486,6 +487,7 @@ def main():
                 log_status, log_result = parse_stdout(log_text, output)
             except FileNotFoundError:
                 log_status, log_result = 'missing stdout', None
+                missing_stdout_subjobs.append(label)
             except OSError as error:
                 log_status, log_result = f'unreadable stdout ({error})', None
             root_status, root_result = None, None
@@ -537,6 +539,8 @@ def main():
     for status, count in sorted(statuses.items()):
         if status != 'successful':
             print(f'  {status}: {count}')
+    if missing_stdout_subjobs:
+        print('Jobs/subjobs with missing stdout: ' + ', '.join(missing_stdout_subjobs))
     print(f'Excluded subjobs without a recorded ROOT output path: {excluded_without_output}')
     for status, count in sorted(job_problems.items()):
         print(f'  Job-directory problem — {status}: {count}')

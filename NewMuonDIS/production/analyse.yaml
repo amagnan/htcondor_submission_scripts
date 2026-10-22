@@ -2,7 +2,7 @@ step: analyse
 tag: TRY2026
 production: 261017
 # Outputs: output_dir/analysis/analysis_name/<source-hash>/[subjob]/analysis_evt*.tar.gz
-analysis_name: replay_gen_v1
+analysis_name: replay_gen_v5
 # input_dir defaults to the production root.
 files_per_job: 50  # Increase to analyse several ROOT files as one chain per job.
 n_jobs: -1

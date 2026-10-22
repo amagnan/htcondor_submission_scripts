@@ -78,6 +78,18 @@ as the defaults when overriding them. For example `--SND: true` also disables
 the default `--noSND`. Input, output, naming and event-range flags are reserved;
 use the corresponding top-level settings instead.
 
+The production YAML files explicitly use the fixed seed `12345`: `options.--seed`
+for generation and both replay stages, and `options.--pythia-decay-seed` for
+filtering's Pythia8 daughter decays. Change these values to select another
+reproducible sequence; use a positive integer below `900000000`. Omitting the
+generation seed, or using `0` for filtering/replay, selects time-based seeding.
+The launcher passes the configured seed unchanged to every job and subjob; it
+does not derive independent seeds for different input files or event ranges.
+Reproducing a job therefore requires the same inputs, software, geometry, options
+and event splitting as well as the same seed. Analysis exposes no seed option.
+These settings apply when preparing new jobs; existing Ganga jobs keep their
+original arguments, and existing outputs are still skipped by default.
+
 ## Splitting and output layout
 
 See the [directory-flow diagram](directory-structure.md) for generation with
@@ -259,10 +271,29 @@ python3 checkAnalysis.py ~/gangadir/workspace/ammagnan/LocalXML \
 Run this in the FairShip Python environment with NumPy/PyYAML and matplotlib.
 `--no-plots` disables merged plot rendering. The merger handles normalization
 record deduplication and recomputes target scaling; the checker does not add an
-extra weight factor. Inputs are unpacked into a new `merged_inputs` directory
+extra weight factor. Inputs are unpacked into a `merged_inputs` directory
 beside `merged`, or into `--unpack-dir`. They are retained so the merged
 `run.json` references accessible inputs. The output must be new or empty and
-the unpack directory must be new; reruns never silently reuse stale inputs.
+the unpack directory can be new or empty. If it is nonempty, a unique `merge_*`
+subdirectory is created to keep previous inputs intact.
+
+For archives dominated by detailed tagger hit records, add `--skip-tagger-tracks`:
+
+```bash
+python3 checkAnalysis.py ~/gangadir/workspace/ammagnan/LocalXML \
+    --first-job 4000 --num-jobs 10 \
+    --merge-output /path/to/analysis/merged --skip-tagger-tracks
+```
+
+Extraction streams one archive at a time and skips `tagger_tracks.csv` without
+writing it to disk. The original `.tar.gz` archives are retained. All histograms,
+cutflows, normalization and pair tables are still merged; tagger summaries do
+not require the detailed track CSV. The unpacked and merged `run.json` files
+record `tagger_tracks.csv` in `omitted_files`. Use `--skip-tagger-tracks` again
+when merging these reduced directories with `mergeAnalysis.py`. Decompressing
+the archives still takes time, but their large track files never occupy unpacked
+disk space. This option belongs to `checkAnalysis.py`, which handles extraction
+and merging; `gangaProdScript.py` creates production jobs.
 
 Failed/missing jobs prevent merging by default. `--merge-successful` explicitly
 allows merging valid outputs only, but the checker still returns a nonzero
