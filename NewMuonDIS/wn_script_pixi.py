@@ -9,6 +9,8 @@ from pathlib import Path
 
 def prepare_analysis(source, config):
     """Isolate selected sources for analyseEvents' discovery, preserving provenance."""
+    config = dict(config)
+    require_filter = config.pop('require_replayfilter', False)
     if config['type'].startswith('disreplay') and config.get('geometry_file'):
         geometry = Path(config['geometry_file']).expanduser().resolve()
         if not geometry.is_file():
@@ -20,13 +22,21 @@ def prepare_analysis(source, config):
     directory.mkdir()
     for index, source in enumerate(sources):
         source = Path(source).resolve(strict=True)
+        if require_filter:
+            from replayProduction import read_filter_manifest
+            read_filter_manifest(source.with_suffix('.json'))
         # Keep repeated basenames and their geometries separate, in chain order.
         folder = directory if len(sources) == 1 else directory / f'{index:0{len(str(len(sources)))}d}'
         folder.mkdir(exist_ok=True)
-        (folder / source.name).symlink_to(source)
+        name = source.name
+        if require_filter:
+            # FairShip discovery expects sim_*_<replay type>.root; retain the
+            # requested production basename through the symlink's resolved path.
+            name = 'sim_' + source.name.removeprefix('sim_').replace('_filtered_test.root', '.root').replace('_filtered.root', '.root')
+        (folder / name).symlink_to(source)
         if config['type'].startswith('disreplay') and not config.get('geometry_file'):
-            geometry = source.with_name('geo_' + source.name[4:]).resolve(strict=True)
-            (folder / geometry.name).symlink_to(geometry)
+            geometry = source.with_name('geo_' + source.name.removeprefix('sim_')).resolve(strict=True)
+            (folder / ('geo_' + name.removeprefix('sim_'))).symlink_to(geometry)
     config = dict(config, production_path=str(directory.resolve()))
     Path('analysis-config.json').write_text(json.dumps(config, indent=2, allow_nan=False))
 
@@ -37,9 +47,9 @@ def archive_analysis(directory):
     with (directory / 'run.json').open() as stream:
         manifest = json.load(stream)
     version = manifest.get('output_version')
-    if version not in (3, 4, 5):
+    if version not in (3, 4, 5, 6):
         raise ValueError(f'Unsupported analysis output_version {version!r} in {directory / "run.json"}; '
-                         'expected 3, 4 or 5')
+                         'expected 3, 4, 5 or 6')
     with tarfile.open(str(directory) + '.tar.gz', 'w:gz') as archive:
         archive.add(directory, arcname=directory.name)
 
@@ -72,11 +82,15 @@ def main():
         default = "newMuonDIS/prepareEvents.py"
     )
 
-    parser.add_argument('--analysis-source', action='append',
-                        help='ROOT source to stage for analyseEvents; repeat for multiple files')
+    analysis_sources = parser.add_mutually_exclusive_group()
+    analysis_sources.add_argument('--analysis-source', action='append',
+                                  help='ROOT source to stage for analyseEvents; repeat for multiple files')
+    analysis_sources.add_argument('--analysis-sources-file', type=Path,
+                                  help='Sandbox JSON list of sources for grouped replay analysis')
     analysis_config = parser.add_mutually_exclusive_group()
     analysis_config.add_argument('--analysis-config', help='JSON analyseEvents settings')
     analysis_config.add_argument('--analysis-config-b64', help='URL-safe base64 JSON analyseEvents settings')
+    parser.add_argument('--replayfilter-config-file', type=Path, help='Sandbox JSON replay chain configuration')
 
     # Everything after this is passed through to the FairShip script
     parser.add_argument(
@@ -86,12 +100,23 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.analysis_sources_file is not None:
+        args.analysis_source = json.loads(args.analysis_sources_file.read_text())
+        if (not isinstance(args.analysis_source, list) or not args.analysis_source
+                or any(not isinstance(source, str) or not source for source in args.analysis_source)):
+            parser.error('--analysis-sources-file must contain a nonempty list of paths')
 
     current_dir = Path.cwd()
 
     # Derive defaults if not provided
     FS_INSTALL = args.fs_install or current_dir 
     RUN_SCRIPT = f"{FS_INSTALL}/{args.runfile}"
+    if args.replayfilter_config_file:
+        if args.analysis_source:
+            parser.error('Choose replayfilter or analysis')
+        config = json.loads(args.replayfilter_config_file.read_text())
+        Path('replayfilter-config.json').write_text(json.dumps(config))
+        RUN_SCRIPT = str(Path(__file__).resolve().with_name('replayfilter_worker.py'))
 
     fs_tag = args.FairShip_tag
     print(f"INFO: Running at the site {args.site}")

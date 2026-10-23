@@ -29,7 +29,7 @@ from productionState import ProductionState, state_lock
 
 
 DATA_STEPS = ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter')
-STEPS = (*DATA_STEPS, 'analyse')
+STEPS = (*DATA_STEPS, 'replayfilter', 'analyse')
 DEFAULTS = {
     'tag': 'TRY2026',
     'production': 261009,
@@ -42,6 +42,9 @@ DEFAULTS = {
     'max_runtime': 86000,
     'n_jobs': -1,  # Maximum new Ganga jobs after skipping outputs; -1 selects all.
     'files_per_job': 1,  # Analysis only: consecutive inputs in one chain.
+    'masters_per_job': None,  # Replay analysis: complete filter masters per chain.
+    'replay_type': 'disreplay_gen',
+    'geometry_file': None,  # Replay filter override; otherwise each source's sibling.
     'skip_existing': True,
     'resubmit_incomplete': False,
     'state_file': None,  # Optional persistent plan and Ganga submission history.
@@ -61,6 +64,13 @@ REPLAY_OPTIONS = {
     '--strawDesign': 10, '--noSND': True, '--debug': 0, '--seed': 0,
 }
 STEP_DEFAULTS = {
+    'replayfilter': {
+        'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
+        'executable': 'newMuonDIS/replayFilter.py',
+        'input_pattern': 'sim_*_disreplay_gen.root',
+        'events_per_file': -1,
+        'options': {},
+    },
     'analyse': {
         'fs_install': '/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
         'executable': 'newMuonDIS/analyseEvents.py',
@@ -126,6 +136,10 @@ def load_settings(filename):
     options.update(supplied.get('options', {}))
     settings.update(supplied)
     settings['options'] = options
+    if settings['replay_type'] not in ('disreplay_gen', 'disreplay_filter'):
+        raise ValueError('replay_type must be disreplay_gen or disreplay_filter')
+    if step == 'replayfilter' and 'input_pattern' not in supplied:
+        settings['input_pattern'] = 'sim_*_' + settings['replay_type'] + '.root'
     for key in ('skip_existing', 'resubmit_incomplete', 'retry_failed'):
         if type(settings[key]) is not bool:
             raise ValueError(f'{key} must be true or false')
@@ -151,6 +165,8 @@ def load_settings(filename):
         if 'input_pattern' not in supplied:
             prefix = 'sim_' if analysis['type'].startswith('disreplay') else 'muonDis_'
             settings['input_pattern'] = prefix + '*_' + analysis['type'] + '.root'
+            if settings['masters_per_job'] is not None:
+                settings['input_pattern'] = '*_' + analysis['type'] + '_filtered.root'
 
     if step == 'disgen' and settings['n_subjobs'] is None and settings['events_per_subjob'] is None:
         settings['events_per_subjob'] = 25000
@@ -256,6 +272,9 @@ def production_stem(source):
 
 
 def output_names(step, chunk):
+    if step == 'replayfilter':
+        name = chunk[-1]
+        return [name, 'geo_' + name.removeprefix('sim_'), str(Path(name).with_suffix('.json'))]
     if step == 'analyse':
         return [chunk[-1] + '.tar.gz']
     if step.startswith('disreplay'):
@@ -386,6 +405,10 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
     integer(settings, 'max_runtime', 1)
     limit = integer(settings, 'n_jobs', 0, allow_all=True)
     files_per_job = integer(settings, 'files_per_job', 1)
+    if settings['masters_per_job'] is not None:
+        integer(settings, 'masters_per_job', 1)
+        if settings['step'] != 'analyse':
+            raise ValueError('masters_per_job is only supported for step: analyse')
     if settings['step'] != 'analyse' and files_per_job != 1:
         raise ValueError('files_per_job is only supported for step: analyse')
     if summary is None:
@@ -407,6 +430,12 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
     saved = state.plans(settings) if state is not None else None
     if saved is not None and not extend:
         return select_pending_jobs(settings, saved, limit, summary, state)
+    if settings['step'] == 'replayfilter':
+        from replayProduction import plan_filter
+        jobs = plan_filter(settings, test, saved or [])
+        if state is not None:
+            jobs = state.set_plans(settings, jobs, output_names)
+        return select_pending_jobs(settings, jobs, limit, summary, state)
     directory = settings['input_dir']
     output = settings['output_dir']
     step = settings['step']
@@ -433,11 +462,15 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
             continue
         if step == 'analyse':
             prefix = 'sim_' if settings['analysis']['type'].startswith('disreplay') else 'muonDis_'
+            if settings['masters_per_job'] is not None:
+                prefix = 'muonDis_'
             if not source.name.startswith(prefix):
                 continue
             if settings['analysis']['type'].startswith('disreplay') and not settings['analysis'].get('geometry_file'):
-                geometry = source.with_name('geo_' + source.name[4:])
+                geometry = source.with_name('geo_' + source.name.removeprefix('sim_'))
                 if not geometry.is_file():
+                    if settings['masters_per_job'] is not None:
+                        raise ValueError(f'Missing replay geometry: {geometry}')
                     summary['skipped_missing_geometry_inputs'] += 1
                     summary['warnings'].append(f'Missing replay geometry: {geometry}; skipping input {source}.')
                     continue
@@ -454,8 +487,12 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
     known_sources = {source.resolve() for plan in jobs for source in plan['sources']}
     sources = [source for source in sources if source.resolve() not in known_sources]
     generation_dirs = set()
-    for offset in range(0, len(sources), files_per_job):
-        group = sources[offset:offset + files_per_job]
+    if step == 'analyse' and settings['masters_per_job'] is not None:
+        from replayProduction import analysis_groups
+        groups = analysis_groups(settings, sources, test)
+    else:
+        groups = [sources[offset:offset + files_per_job] for offset in range(0, len(sources), files_per_job)]
+    for group in groups:
         source = group[0]
         relative = source.relative_to(directory)
         folder = relative.parent
@@ -480,9 +517,14 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
                 '--site', settings['site'], '--', '-f', str(source), *options]
         if step == 'analyse':
             # Keep JSON quotes out of Ganga/Condor's command-line serialization.
+            worker_config = dict(settings['analysis'])
+            if settings['masters_per_job'] is not None:
+                worker_config['require_replayfilter'] = True
             analysis_config = base64.urlsafe_b64encode(
-                json.dumps(settings['analysis'], allow_nan=False).encode('utf-8')).decode('ascii')
+                json.dumps(worker_config, allow_nan=False).encode('utf-8')).decode('ascii')
             source_args = [arg for item in group for arg in ('--analysis-source', str(item))]
+            if settings['masters_per_job'] is not None:
+                source_args = ['--analysis-sources-file', f'analysis-sources-{identity}.json']
             args = ['--fs-install', settings['fs_install'], '--runfile', settings['executable'],
                     '--site', settings['site'], *source_args,
                     '--analysis-config-b64', analysis_config,
@@ -520,6 +562,19 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
     return select_pending_jobs(settings, jobs, limit, summary, state)
 
 
+def sandbox_manifest(name, data):
+    manifest = SCRIPT_DIR / 'production' / '.inputs' / name
+    contents = json.dumps(data, indent=2) + '\n'
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with manifest.open('x') as stream:
+            stream.write(contents)
+    except FileExistsError:
+        if manifest.read_text() != contents:
+            raise ValueError(f'Sandbox manifest differs from saved inputs: {manifest}')
+    return manifest
+
+
 def prepare_jobs(settings, jobs, submit=False, state=None):
     outdir = str(settings['output_dir']) + '/'
     if submit:
@@ -533,9 +588,22 @@ def prepare_jobs(settings, jobs, submit=False, state=None):
         if not plan['split']:
             application_args.extend(plan['subjobs'][0])
         j.application = Executable(exe=File(wrapper), args=application_args)
+        if settings['step'] == 'replayfilter':
+            name = plan['args'][plan['args'].index('--replayfilter-config-file') + 1]
+            manifest = sandbox_manifest(name, plan['filter_config'])
+            j.inputsandbox = [File(str(SCRIPT_DIR / name)) for name in ('replayfilter_worker.py', 'replayChain.py')]
+            j.inputsandbox.append(File(str(manifest)))
+        elif settings['step'] == 'analyse' and settings['masters_per_job'] is not None:
+            # Complete masters can contain thousands of files: transfer the list
+            # in the sandbox instead of exceeding Condor/exec argument limits.
+            name = plan['args'][plan['args'].index('--analysis-sources-file') + 1]
+            manifest = sandbox_manifest(name, [str(source) for source in plan['sources']])
+            j.inputsandbox = [File(str(SCRIPT_DIR / 'replayProduction.py')), File(str(manifest))]
         if plan['split']:
             j.splitter = ArgSplitter(args=plan['subjobs'], append=True)
         pattern = 'analysis_evt*.tar.gz' if settings['step'] == 'analyse' else f'*_{settings["step"]}.root'
+        if settings['step'] == 'replayfilter':
+            pattern = f'*_{settings["replay_type"]}_filtered*.*'
         j.outputfiles = [MassStorageFile(pattern,
                                        outputfilenameformat=plan['output_format'])]
         j.backend = Condor()
@@ -549,6 +617,8 @@ def prepare_jobs(settings, jobs, submit=False, state=None):
         j.postprocessors.append(fc)
         execution = f'{len(plan["subjobs"])} subjobs' if plan['split'] else 'one unsplit job'
         j.comment = f'{settings["step"]}: {execution} from {plan["source"]}'
+        if 'master' in plan:
+            j.comment += f'; prepared DIS file: {plan["master"]}'
         if len(plan['sources']) > 1:
             j.comment += f' and {len(plan["sources"]) - 1} more inputs'
         if 'original_range' in plan:
@@ -605,6 +675,8 @@ def main():
     parser.add_argument('--submit', action='store_true', help='Submit prepared jobs (requires Ganga)')
     parser.add_argument('--files-per-job', type=int,
                         help='Analysis input files per job (overrides YAML; default 1)')
+    parser.add_argument('--masters-per-job', type=int,
+                        help='Complete replayfilter masters per analysis job (overrides YAML)')
     parser.add_argument('--n-jobs', type=int, help='Maximum new Ganga jobs in this batch (overrides YAML)')
     parser.add_argument('--state-file', type=Path, help='Persistent production plan and Ganga history')
     parser.add_argument('--retry-failed', action='store_true', default=None,
@@ -636,6 +708,8 @@ def main():
         settings = load_settings(args.yaml_file)
         if args.files_per_job is not None:
             settings['files_per_job'] = args.files_per_job
+        if args.masters_per_job is not None:
+            settings['masters_per_job'] = args.masters_per_job
         if args.n_jobs is not None:
             settings['n_jobs'] = args.n_jobs
         if args.state_file is not None:
@@ -715,8 +789,9 @@ def run_production(settings, args, state=None):
     print(f'Input directory: {settings["input_dir"]}')
     print(f'Output directory: {settings["output_dir"]}')
     for index, plan in enumerate(jobs, 1):
-        first = int(plan['subjobs'][0][1])
-        last_start, last_size = map(int, (plan['subjobs'][-1][1], plan['subjobs'][-1][3]))
+        chunks = [chunk[chunk.index('--') + 1:] if '--' in chunk else chunk for chunk in plan['subjobs']]
+        first = int(chunks[0][1])
+        last_start, last_size = map(int, (chunks[-1][1], chunks[-1][3]))
         stop = 'EOF' if last_size == -1 else str(last_start + last_size)
         ranges = (f'original range {plan["original_range"]}' if 'original_range' in plan
                   else f'{len(plan["subjobs"])} range(s)')

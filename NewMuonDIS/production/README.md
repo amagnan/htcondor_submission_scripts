@@ -32,6 +32,8 @@ Use the other YAML files in the same commands when their inputs are ready:
 | 2 | disreplay_gen.yaml | macro/run_simScript.py | *_disgen.root |
 | 3 | disfilter.yaml | newMuonDIS/filterEvents.py | *_disgen.root |
 | 4 | disreplay_filter.yaml | macro/run_simScript.py | *_disfilter.root |
+| 5 | replayfilter.yaml | newMuonDIS/replayFilter.py | sim_*_disreplay_gen.root |
+| 6 | analyse.yaml | newMuonDIS/analyseEvents.py | filtered sim_*_disreplay_gen.root |
 
 Steps 2 and 3 independently consume Step 1; Step 4 consumes Step 3. The script
 does not schedule dependencies or wait for upstream jobs to finish.
@@ -48,6 +50,9 @@ Each YAML contains exactly one `step`. All other settings have defaults:
 | input_dir | Step 1 simulation directory; later stages default to output_dir |
 | input_pattern | Recursive filename glob, as in the table above |
 | n_jobs | Maximum new Ganga master jobs after skipping existing outputs; -1 selects all pending work, 0 selects none |
+| masters_per_job | Complete replayfilter masters per analysis chain; production/analyse.yaml uses 10; CLI: --masters-per-job |
+| master_depth | replayfilter: number of relative directory levels identifying a disgen master, default 1 |
+| replay_type, geometry_file | replayfilter: disreplay_gen (or disreplay_filter), optional shared geometry override |
 | files_per_job | Analysis only: positive number of input files per job, default 1; CLI override: --files-per-job |
 | skip_existing | Skip complete output sets, default true; false restores the stop-on-existing-output behavior |
 | resubmit_incomplete | Default false: preserve empty/partial outputs and skip their ranges. True opts into cleanup and resubmission |
@@ -174,6 +179,60 @@ Existing outputs, including empty or partial sets, are skipped before applying
 `n_jobs`, so repeated invocations advance through the remaining work. Cleanup
 and resubmission require explicit opt-in. See the batch-production behavior below.
 
+## Replay selection before analysis
+
+Run `production/replayfilter.yaml` after the selected replay jobs have finished,
+then `production/analyse.yaml`. Both target production 261021. Each filter job
+is **unsplit** and corresponds to **one disgen file** (one generation subjob),
+combining all of that file's `disreplay_gen` outputs as a `TChain`.
+
+```bash
+python3 gangaProdScript.py production/replayfilter.yaml --verbose
+./gangaSubmit.sh production/replayfilter.yaml --submit
+python3 checkReplayFilter.py ~/gangadir/workspace/ammagnan/LocalXML \
+    --first-job 4000 --num-jobs 10
+python3 gangaProdScript.py production/analyse.yaml --verbose
+```
+
+For example:
+
+```text
+P/C/g/muonDis_example_disgen.root
+P/C/g/0/sim_muonDis_example_evt0_1000_disreplay_gen.root
+P/C/g/1/sim_muonDis_example_evt1000_all_disreplay_gen.root
+    -> one unsplit filter job reading a TChain of those two replay files
+P/C/g/muonDis_example_disreplay_gen_filtered.root
+P/C/g/geo_muonDis_example_disreplay_gen_filtered.root
+P/C/g/muonDis_example_disreplay_gen_filtered.json
+```
+
+The planner locates the corresponding prepared file in each replay file's
+ancestor directories, matching its stem. No new filter output directory or
+Ganga subjob directory is added. `output_dir` must contain those prepared files,
+so Ganga transfers the outputs back beside them. The ordered input list is
+transferred as a JSON sandbox file, avoiding command-line size limits.
+
+Filtering preserves every branch of accepted events. Normalization records
+from all chain members are combined by their stable IDs. Each source's auxiliary
+ROOT objects and tree user information are retained under `replay_sources/`;
+JSON provenance records its UUID, processed range and selection counts.
+Branch schemas and companion geometries must agree across the chain. Empty
+selected trees retain their schema and normalization. The checker validates
+worker completion, all three transfers, manifests, sizes and chain totals,
+and reports event efficiency and ROOT size reduction without reading ROOT events.
+
+`--test` processes at most 100 entries of one chain in one unsplit job and uses
+`_disreplay_gen_filtered_test.root` as its suffix. These test outputs are excluded
+by the normal analysis pattern; full analysis also rejects test manifests if
+they are selected explicitly.
+
+The optional `disreplay_filter` branch analogously groups replay files by their
+corresponding `*_disfilter.root` input and uses `_disreplay_filter_filtered`.
+Finish upstream production before filtering. A state file freezes chain inputs;
+extending a saved plan allows new prepared files but rejects changed input
+lists for existing jobs. Retrying a partial output set reruns its whole chain.
+Use a fresh state file for this layout; previous per-replay-subjob plans do not apply.
+
 ## Analysis jobs and merging
 
 `production/analyse.yaml` adds `step: analyse`, running
@@ -188,27 +247,27 @@ python3 gangaProdScript.py production/analyse.yaml --test
 ./gangaSubmit.sh production/analyse.yaml --submit
 ```
 
-By default, each selected event file creates one job. Set `files_per_job` to a
-positive integer to group consecutive files from the sorted input selection into
-one analysis chain; the last job may contain fewer files. For example:
+The supplied YAML now consumes only completed `replayfilter` outputs and uses
+`masters_per_job: 10`: up to ten filtered disgen files form one analysis chain. The final group may
+contain fewer files. This is a tunable
+placeholder, also available as `--masters-per-job 10`. The input directory
+defaults to the production root `P`, selecting only `*_disreplay_gen_filtered.root`.
+Missing manifests, inconsistent chain counts and changed file sizes stop planning.
+`n_jobs` limits analysis jobs; `masters_per_job` counts unsplit filter jobs (one output each).
 
-```yaml
-files_per_job: 10
-n_subjobs: 1
-events_per_file: -1
-first_event: 0
-```
+For generation-only analysis, omit `masters_per_job` and use `files_per_job`
+to group individual input files. Do not set both grouping options.
 
-This processes all entries from up to ten files per job. Alternatively, pass
-`--files-per-job 10` to `gangaProdScript.py` or `gangaSubmit.sh`.
-`n_jobs` still limits Ganga master jobs. Groups are formed before checking
-existing outputs and applying that limit, so repeated submissions with the same
-input selection keep the same groups.
-
-The worker stages links to only the selected files and their replay geometries,
+For grouped replay analysis, Ganga transfers a JSON input list from
+`production/.inputs/`; keep these files while jobs may still be prepared or
+resubmitted. This avoids command-line limits with thousands of selected files.
+The worker stages links to the selected files and their replay geometries,
+using the `sim_*_disreplay_gen.root` aliases expected by FairShip discovery.
+The manifest still records the resolved production filenames, including the new suffix,
 using separate directories for files with identical names. Geometry is required beside each replay
 input unless `analysis.geometry_file` supplies an absolute override. Inputs with
-missing geometry are skipped without consuming the job budget; the preview
+missing geometry stop grouped replay planning. In individual-file mode they
+are skipped without consuming the job budget; the preview
 reports their count and `--verbose` lists their paths. If all matching inputs
 lack geometry, no jobs are prepared. `run.json`
 records the resolved source paths, ROOT UUIDs, processed ranges and analysis
@@ -242,7 +301,7 @@ geometry) can change group boundaries. Keep the selection fixed when resuming,
 and choose a new `analysis_name` when changing selections, weights, grouping or
 splitting. Existing nonempty
 archives are skipped before applying the job limit. Each archive contains the **complete**
-analysis directory: `run.json`, histogram archive, CSV tables, pair details and
+analysis directory: `run.json`, histogram archive, CSV summaries, `events.jsonl` (one record per selected replay event) and
 all nested plots. The worker marks completion only after packaging succeeds;
 Ganga transfers the archive using its usual `MassStorageFile` handler.
 
@@ -277,23 +336,20 @@ beside `merged`, or into `--unpack-dir`. They are retained so the merged
 the unpack directory can be new or empty. If it is nonempty, a unique `merge_*`
 subdirectory is created to keep previous inputs intact.
 
-For archives dominated by detailed tagger hit records, add `--skip-tagger-tracks`:
+For version-6 archives, add `--skip-event-records` to merge only histograms,
+cutflows and normalization:
 
 ```bash
 python3 checkAnalysis.py ~/gangadir/workspace/ammagnan/LocalXML \
     --first-job 4000 --num-jobs 10 \
-    --merge-output /path/to/analysis/merged --skip-tagger-tracks
+    --merge-output /path/to/analysis/merged --skip-event-records
 ```
 
-Extraction streams one archive at a time and skips `tagger_tracks.csv` without
-writing it to disk. The original `.tar.gz` archives are retained. All histograms,
-cutflows, normalization and pair tables are still merged; tagger summaries do
-not require the detailed track CSV. The unpacked and merged `run.json` files
-record `tagger_tracks.csv` in `omitted_files`. Use `--skip-tagger-tracks` again
-when merging these reduced directories with `mergeAnalysis.py`. Decompressing
-the archives still takes time, but their large track files never occupy unpacked
-disk space. This option belongs to `checkAnalysis.py`, which handles extraction
-and merging; `gangaProdScript.py` creates production jobs.
+This skips extracting `events.jsonl` and records it in `omitted_files`; original
+archives remain available. Use the same flag with `mergeAnalysis.py` when
+merging these reduced directories later. The checker accepts an empty
+`events.jsonl` when zero events were processed. Version 6 no longer requires
+`pairs.csv` or `tagger_tracks.csv`.
 
 Failed/missing jobs prevent merging by default. `--merge-successful` explicitly
 allows merging valid outputs only, but the checker still returns a nonzero

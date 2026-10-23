@@ -46,20 +46,24 @@ def read_analysis_archive(filename):
         with archive.extractfile(manifest_member) as stream:
             manifest = json.load(stream)
         version = manifest.get('output_version')
-        if version not in (3, 4, 5):
+        if version not in (3, 4, 5, 6):
             raise ValueError(f'Unsupported analysis output_version {version!r} in {root}/run.json; '
-                             'expected 3, 4 or 5')
+                             'expected 3, 4, 5 or 6')
         kind = manifest['analysis_signature']['type']
         if kind not in ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter'):
             raise ValueError('Unknown analysis type')
         required = ['run.json', 'histograms.npz', 'histogram_flows.csv', 'normalization.csv']
-        required += (['cutflow.csv', 'pair_cutflow.csv', 'pair_composition_cutflow.csv', 'pairs.csv']
+        required += (['cutflow.csv', 'pair_cutflow.csv', 'pair_composition_cutflow.csv']
                      if kind.startswith('disreplay') else ['vertex_counts.csv'])
+        if kind.startswith('disreplay') and version < 6:
+            required += ['pairs.csv']
         if version >= 4 and kind.startswith('disreplay'):
-            required += ['tagger_cutflow.csv', 'tagger_tracks.csv']
+            required += ['tagger_cutflow.csv']
+            required += ['events.jsonl'] if version >= 6 else ['tagger_tracks.csv']
         for name in required:
             member = archive.getmember(root + '/' + name)
-            if not member.isfile() or member.size == 0:
+            if not member.isfile() or (member.size == 0 and not (
+                    name == 'events.jsonl' and manifest.get('entries_processed') == 0)):
                 raise ValueError(f'Missing or empty {name}')
         processed = manifest['entries_processed']
         if type(processed) is not int or processed < 0:
@@ -125,6 +129,9 @@ def merge_analysis(results, args):
     print(f'Retaining merge inputs in {unpack}', flush=True)
     inputs = []
     for index, result in enumerate(results):
+        omitted = 'events.jsonl' if args.skip_event_records else 'tagger_tracks.csv' if args.skip_tagger_tracks else None
+        if args.skip_tagger_tracks and result['manifest']['output_version'] >= 6:
+            raise ValueError('Use --skip-event-records for analysis output version 6')
         folder = unpack / str(index)
         folder.mkdir()
         with tarfile.open(result['archive'], 'r|gz') as archive:
@@ -136,7 +143,7 @@ def merge_analysis(results, args):
                         or parts[0] != result['directory']
                         or not (member.isfile() or member.isdir())):
                     raise ValueError(f'Unsafe archive member: {member.name}')
-                if args.skip_tagger_tracks and parts == (result['directory'], 'tagger_tracks.csv'):
+                if omitted and parts == (result['directory'], omitted):
                     print(f'Skipping {member.name} ({member.size / 1024**2:.1f} MiB unpacked)', flush=True)
                     continue
                 target = folder / member.name
@@ -147,10 +154,10 @@ def merge_analysis(results, args):
                     with archive.extractfile(member) as source, target.open('xb') as output:
                         shutil.copyfileobj(source, output)
         directory = folder / result['directory']
-        if args.skip_tagger_tracks and result['manifest']['analysis_signature']['type'].startswith('disreplay'):
+        if omitted and result['manifest']['analysis_signature']['type'].startswith('disreplay'):
             manifest_path = directory / 'run.json'
             manifest = json.loads(manifest_path.read_text())
-            manifest['omitted_files'] = sorted(set(manifest.get('omitted_files', [])) | {'tagger_tracks.csv'})
+            manifest['omitted_files'] = sorted(set(manifest.get('omitted_files', [])) | {omitted})
             manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
         inputs.append(str(directory))
     command = [sys.executable, str(args.merger), *inputs, '-o', str(destination)]
@@ -158,6 +165,8 @@ def merge_analysis(results, args):
         command.append('--no-plots')
     if args.skip_tagger_tracks:
         command.append('--skip-tagger-tracks')
+    if args.skip_event_records:
+        command.append('--skip-event-records')
     print(f'Running merger on {len(inputs)} validated outputs', flush=True)
     subprocess.run(command, check=True)
 
@@ -242,11 +251,16 @@ def main():
     parser.add_argument('--skip-tagger-tracks', action='store_true',
                         help='Skip extracting and merging tagger_tracks.csv; retain original archives '
                              'and merge all histograms and summary tables')
+    parser.add_argument('--skip-event-records', action='store_true',
+                        help='Skip extracting/merging events.jsonl; retain histograms and summary tables')
     parser.add_argument('--merge-successful', action='store_true',
                         help='Explicitly allow a partial merge of valid jobs')
     args = parser.parse_args()
-    if not args.merge_output and (args.unpack_dir or args.no_plots or args.skip_tagger_tracks or args.merge_successful):
-        parser.error('--unpack-dir, --no-plots, --skip-tagger-tracks and --merge-successful require --merge-output')
+    if args.skip_event_records and args.skip_tagger_tracks:
+        parser.error('Choose --skip-event-records or --skip-tagger-tracks')
+    if not args.merge_output and (args.unpack_dir or args.no_plots or args.skip_tagger_tracks
+                                  or args.skip_event_records or args.merge_successful):
+        parser.error('--unpack-dir, --no-plots, --skip-event-records, --skip-tagger-tracks and --merge-successful require --merge-output')
     base = args.path.expanduser()
     if not base.is_dir():
         parser.error(f'Not a directory: {base}')
