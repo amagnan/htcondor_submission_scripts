@@ -1,0 +1,36 @@
+# Replay checker-approved disgen files; use saved ROOT entry counts for splitting.
+step: disreplay_gen
+# upstream: disgen
+events_per_subjob: 1000        # Example size; default null (one range).
+options:
+  --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
+  --shieldName: null           # Suppress workflow default TRY_2026 when using --geofile.
+  --strawDesign: null          # Suppress workflow default 10 when using --geofile.
+  --noSND: false               # Suppress workflow default true when using --geofile.
+  # --NewMuDIS: true           # Required replay generator; workflow default true.
+  # --field_map: files/2026_07_02_MainSpectrometerField_V21_2455.root
+  # --debug: 0
+  # --seed: 0                  # 0 = time-based.
+# Other run_simScript.py physics flags can be supplied in options.
+# Input/output/range flags are reserved for the workflow.
+
+# first_event: 0
+# events_per_file: -1          # All entries reported by the upstream checker.
+# n_subjobs: null              # Alternative to events_per_subjob.
+# Less commonly changed workflow settings (defaults shown).
+# workflow: workflow.yaml       # Relative to this file.
+# name: STEP                   # Default: the step value; use a new name for a new selection.
+# require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
+# n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
+# Resource overrides inherit workflow.yaml; its defaults are:
+# max_runtime: 86000            # Seconds.
+# memory_mb: 3000
+# disk_mb: 50000                # Requested worker disk; site limits still apply.
+# cpus: 1
+# accounting_group: group_u_SHIP.u_ship_cg
+# fs_install: /afs/cern.ch/work/a/ammagnan/FairShip-cvmfs
+# workspace: ~/gangadir/workspace/ammagnan/LocalXML  # Default uses current username.
+# state_dir: .state             # Relative to workflow.yaml (or this file if overridden here).
+# output_base: /eos/experiment/ship/user/ammagnan/MuonDIS
+# tag: TRY2026
+# production: new_production

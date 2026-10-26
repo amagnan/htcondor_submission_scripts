@@ -1,0 +1,28 @@
+# Run locally through the same entry point: ./gangaSubmit.sh merger.yaml --submit.
+step: merger
+# upstream: analysis
+skip_event_records: true      # Do not extract or merge the large events.jsonl.
+save_plots: true              # false keeps tables/histograms without rendering.
+# merge_output: null          # Default: OUTPUT_BASE/TAG/PRODUCTION/MODE/merger/merged.
+# unpack_dir: null            # Default: merge_output + "_inputs"; retained for provenance.
+# Explicit merge_output/unpack_dir get a "_test" suffix with --test.
+# Destination must be new/empty. Set a different path for a subsequent merge.
+# require_complete: true      # false explicitly allows merging successful analysis ranges only.
+
+# Less commonly changed workflow settings (defaults shown).
+# workflow: workflow.yaml       # Relative to this file.
+# name: STEP                   # Default: the step value; use a new name for a new selection.
+# require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
+# n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
+# Resource overrides inherit workflow.yaml; its defaults are:
+# max_runtime: 86000            # Seconds.
+# memory_mb: 3000
+# disk_mb: 50000                # Requested worker disk; site limits still apply.
+# cpus: 1
+# accounting_group: group_u_SHIP.u_ship_cg
+# fs_install: /afs/cern.ch/work/a/ammagnan/FairShip-cvmfs
+# workspace: ~/gangadir/workspace/ammagnan/LocalXML  # Default uses current username.
+# state_dir: .state             # Relative to workflow.yaml (or this file if overridden here).
+# output_base: /eos/experiment/ship/user/ammagnan/MuonDIS
+# tag: TRY2026
+# production: new_production
