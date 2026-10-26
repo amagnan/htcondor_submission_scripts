@@ -26,6 +26,7 @@ SCRIPT_DIR = Path(sys.argv[0] if IN_GANGA else __file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from productionState import ProductionState, state_lock
+from preparationInputs import PreparationInputs
 
 
 DATA_STEPS = ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter')
@@ -44,8 +45,11 @@ DEFAULTS = {
     'files_per_job': 1,  # Analysis only: consecutive inputs in one chain.
     'masters_per_job': None,  # Replay analysis: complete filter masters per chain.
     'replay_type': 'disreplay_gen',
+    'replay_inputs': None,  # checkReplay export; mandatory for replayfilter.
+    'analysis_inputs': None,  # checkReplayFilter export; fixes the analysis batch.
     'geometry_file': None,  # Replay filter override; otherwise each source's sibling.
     'skip_existing': True,
+    'allow_partial': True,  # Skip inputs without complete preparation metadata.
     'resubmit_incomplete': False,
     'state_file': None,  # Optional persistent plan and Ganga submission history.
     'retry_failed': False,
@@ -140,7 +144,7 @@ def load_settings(filename):
         raise ValueError('replay_type must be disreplay_gen or disreplay_filter')
     if step == 'replayfilter' and 'input_pattern' not in supplied:
         settings['input_pattern'] = 'sim_*_' + settings['replay_type'] + '.root'
-    for key in ('skip_existing', 'resubmit_incomplete', 'retry_failed'):
+    for key in ('skip_existing', 'resubmit_incomplete', 'retry_failed', 'allow_partial'):
         if type(settings[key]) is not bool:
             raise ValueError(f'{key} must be true or false')
     if step == 'analyse':
@@ -183,6 +187,25 @@ def load_settings(filename):
     settings['output_dir'] = Path(output).expanduser().resolve()
     settings['input_dir'] = Path(settings['input_dir'] or settings['output_dir']).expanduser().resolve()
     settings['fs_install'] = str(Path(settings['fs_install']).expanduser().resolve())
+    if settings['replay_inputs'] is not None:
+        if step != 'replayfilter' or not isinstance(settings['replay_inputs'], str) or not settings['replay_inputs']:
+            raise ValueError('replay_inputs must be a nonempty path for step: replayfilter')
+        replay_inputs = Path(settings['replay_inputs']).expanduser()
+        if not replay_inputs.is_absolute():
+            replay_inputs = Path(filename).resolve().parent / replay_inputs
+        settings['replay_inputs'] = replay_inputs.resolve()
+    if step != 'replayfilter':
+        # Keep the saved configuration of unrelated production stages unchanged.
+        settings.pop('replay_inputs')
+    if settings['analysis_inputs'] is not None:
+        if step != 'analyse' or not isinstance(settings['analysis_inputs'], str) or not settings['analysis_inputs']:
+            raise ValueError('analysis_inputs must be a nonempty path for step: analyse')
+        analysis_inputs = Path(settings['analysis_inputs']).expanduser()
+        if not analysis_inputs.is_absolute():
+            analysis_inputs = Path(filename).resolve().parent / analysis_inputs
+        settings['analysis_inputs'] = analysis_inputs.resolve()
+    else:
+        settings.pop('analysis_inputs')
     if settings['state_file'] is not None:
         if not isinstance(settings['state_file'], str) or not settings['state_file']:
             raise ValueError('state_file must be a nonempty path or null')
@@ -319,8 +342,10 @@ def cleanup_incomplete_outputs(plan):
                 path.unlink()
 
 
-def select_pending_jobs(settings, jobs, limit, summary, state=None):
+def select_pending_jobs(settings, jobs, limit, summary, state=None, input_check=None):
     """Apply the new-job budget after checking each original range destination."""
+    if input_check is not None:
+        jobs = [job for job in jobs if input_check.accept(job['sources'])]
     selected = []
     for job in jobs:
         if limit != -1 and len(selected) >= limit:
@@ -402,6 +427,13 @@ def select_pending_jobs(settings, jobs, limit, summary, state=None):
 
 
 def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
+    if summary is None:
+        summary = {}
+    with PreparationInputs(settings, summary) as input_check:
+        return _plan_jobs(settings, test, summary, state, extend, input_check)
+
+
+def _plan_jobs(settings, test, summary, state, extend, input_check):
     integer(settings, 'max_runtime', 1)
     limit = integer(settings, 'n_jobs', 0, allow_all=True)
     files_per_job = integer(settings, 'files_per_job', 1)
@@ -415,7 +447,8 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
         summary = {}
     summary.update(skipped_ranges=0, skipped_inputs=0, skipped_incomplete_ranges=0,
                    skipped_missing_geometry_inputs=0, skipped_held_ranges=0,
-                   skipped_failed_ranges=0, warnings=[])
+                   skipped_failed_ranges=0, skipped_preparation_inputs=0,
+                   warnings=[], input_warnings=[])
     if test and limit != 0:
         limit = 1
     if test:
@@ -428,20 +461,37 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
             raise ValueError(f'Analysis geometry override is not an accessible file: {geometry}. '
                              'Correct analysis.geometry_file or set it to null to use each input’s sibling geometry.')
     saved = state.plans(settings) if state is not None else None
-    if saved is not None and not extend:
-        return select_pending_jobs(settings, saved, limit, summary, state)
+    checked_inputs = None
+    if settings.get('analysis_inputs'):
+        if (settings['step'] != 'analyse' or settings['masters_per_job'] is None
+                or not settings['analysis']['type'].startswith('disreplay')):
+            raise ValueError('analysis_inputs requires replay analysis with masters_per_job')
+        from replayProduction import checked_analysis_inputs
+        checked_inputs = checked_analysis_inputs(settings['analysis_inputs'])
+        if any(source not in checked_inputs for plan in saved or [] for source in plan['sources']):
+            raise ValueError('Saved analysis plan contains inputs absent from the checked analysis batch')
     if settings['step'] == 'replayfilter':
         from replayProduction import plan_filter
-        jobs = plan_filter(settings, test, saved or [])
+        jobs = plan_filter(settings, test, saved or [], input_check)
+        if saved is not None and not extend:
+            jobs = saved
         if state is not None:
             jobs = state.set_plans(settings, jobs, output_names)
-        return select_pending_jobs(settings, jobs, limit, summary, state)
+        return select_pending_jobs(settings, jobs, limit, summary, state, input_check)
+    if saved is not None and not extend:
+        return select_pending_jobs(settings, saved, limit, summary, state, input_check)
     directory = settings['input_dir']
     output = settings['output_dir']
     step = settings['step']
     if not directory.is_dir():
         raise ValueError(f'Not a directory: {directory}')
-    candidates = set(directory.rglob(settings['input_pattern']))
+    if checked_inputs is not None:
+        for source in checked_inputs:
+            if directory not in source.parents or not source.match(settings['input_pattern']):
+                raise ValueError(f'Checked analysis input does not match this production: {source}')
+        candidates = set(checked_inputs)
+    else:
+        candidates = set(directory.rglob(settings['input_pattern']))
     if ((step in ('disfilter', 'disreplay_gen') and settings['input_pattern'] == '*_disgen.root')
             or (step == 'analyse' and settings['analysis']['type'] == 'disgen'
                 and settings['input_pattern'] == 'muonDis_*_disgen.root')):
@@ -474,8 +524,10 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
                     summary['skipped_missing_geometry_inputs'] += 1
                     summary['warnings'].append(f'Missing replay geometry: {geometry}; skipping input {source}.')
                     continue
-        sources.append(source)
-    if not sources and not summary['skipped_missing_geometry_inputs'] and not saved:
+        if input_check.accept([source]):
+            sources.append(source)
+    if (not sources and not summary['skipped_missing_geometry_inputs']
+            and not summary['skipped_preparation_inputs'] and not saved and checked_inputs is None):
         raise ValueError(f'No matching ROOT files in {directory} ({settings["input_pattern"]})')
     files_per_directory = {}
     for source in sources:
@@ -559,7 +611,7 @@ def plan_jobs(settings, test=False, summary=None, state=None, extend=False):
                      'split': split, 'output_format': output_format})
     if state is not None:
         jobs = state.set_plans(settings, jobs, output_names)
-    return select_pending_jobs(settings, jobs, limit, summary, state)
+    return select_pending_jobs(settings, jobs, limit, summary, state, input_check)
 
 
 def sandbox_manifest(name, data):
@@ -591,14 +643,16 @@ def prepare_jobs(settings, jobs, submit=False, state=None):
         if settings['step'] == 'replayfilter':
             name = plan['args'][plan['args'].index('--replayfilter-config-file') + 1]
             manifest = sandbox_manifest(name, plan['filter_config'])
-            j.inputsandbox = [File(str(SCRIPT_DIR / name)) for name in ('replayfilter_worker.py', 'replayChain.py')]
-            j.inputsandbox.append(File(str(manifest)))
+            j.inputfiles.append(str(SCRIPT_DIR /'replayfilter_worker.py'))
+            j.inputfiles.append(str(SCRIPT_DIR /'replayChain.py'))
+            j.inputfiles.append(str(manifest))
         elif settings['step'] == 'analyse' and settings['masters_per_job'] is not None:
             # Complete masters can contain thousands of files: transfer the list
             # in the sandbox instead of exceeding Condor/exec argument limits.
             name = plan['args'][plan['args'].index('--analysis-sources-file') + 1]
             manifest = sandbox_manifest(name, [str(source) for source in plan['sources']])
-            j.inputsandbox = [File(str(SCRIPT_DIR / 'replayProduction.py')), File(str(manifest))]
+            j.inputfiles.append(str(SCRIPT_DIR / 'replayProduction.py'))
+            j.inputfiles.append(str(manifest))
         if plan['split']:
             j.splitter = ArgSplitter(args=plan['subjobs'], append=True)
         pattern = 'analysis_evt*.tar.gz' if settings['step'] == 'analyse' else f'*_{settings["step"]}.root'
@@ -677,6 +731,8 @@ def main():
                         help='Analysis input files per job (overrides YAML; default 1)')
     parser.add_argument('--masters-per-job', type=int,
                         help='Complete replayfilter masters per analysis job (overrides YAML)')
+    parser.add_argument('--analysis-inputs', type=Path,
+                        help='Checked filter-output JSON for this analysis batch (overrides YAML)')
     parser.add_argument('--n-jobs', type=int, help='Maximum new Ganga jobs in this batch (overrides YAML)')
     parser.add_argument('--state-file', type=Path, help='Persistent production plan and Ganga history')
     parser.add_argument('--retry-failed', action='store_true', default=None,
@@ -703,13 +759,22 @@ def main():
                                                'and rerun those ranges (opt-in)')
     incomplete.add_argument('--no-resubmit-incomplete', dest='resubmit_incomplete', action='store_false',
                             help='Leave empty/partial outputs untouched and continue to later work (default)')
+    partial = parser.add_mutually_exclusive_group()
+    partial.add_argument('--allow-partial', dest='allow_partial', action='store_true', default=None,
+                         help='Skip inputs without complete preparation metadata (default)')
+    partial.add_argument('--require-complete-inputs', dest='allow_partial', action='store_false',
+                         help='Stop if any input lacks complete preparation metadata')
     args = parser.parse_args()
     try:
         settings = load_settings(args.yaml_file)
+        if args.allow_partial is not None:
+            settings['allow_partial'] = args.allow_partial
         if args.files_per_job is not None:
             settings['files_per_job'] = args.files_per_job
         if args.masters_per_job is not None:
             settings['masters_per_job'] = args.masters_per_job
+        if args.analysis_inputs is not None:
+            settings['analysis_inputs'] = args.analysis_inputs.expanduser().resolve()
         if args.n_jobs is not None:
             settings['n_jobs'] = args.n_jobs
         if args.state_file is not None:
@@ -760,6 +825,7 @@ def run_production(settings, args, state=None):
           f'({"submit" if args.submit else "prepare only; use --submit to submit"})')
     print(f'Skipped ranges: {summary["skipped_ranges"]} complete file sets, '
           f'{summary["skipped_incomplete_ranges"]} empty/partial sets left untouched.')
+    print(f'Skipped inputs failing preparation metadata checks: {summary["skipped_preparation_inputs"]}.')
     if state is not None:
         print(f'State: {state.path} ({"current Ganga repository" if state.live else "saved snapshot"}).')
         print('Tracked ranges: ' + ', '.join(f'{count} {status}' for status, count in sorted(state.counts().items())))

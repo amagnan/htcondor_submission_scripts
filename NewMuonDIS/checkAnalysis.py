@@ -20,7 +20,8 @@ import sys
 import tarfile
 import tempfile
 
-from checkPrepareEventsOutputs import eos_path, print_stats, subjob_logs
+from checkPrepareEventsOutputs import (eos_path, print_stats, require_preparation_metadata,
+                                       subjob_logs)
 
 
 def read_analysis_archive(filename):
@@ -45,6 +46,10 @@ def read_analysis_archive(filename):
             raise ValueError('Invalid or oversized run.json')
         with archive.extractfile(manifest_member) as stream:
             manifest = json.load(stream)
+        try:
+            require_preparation_metadata(manifest.get('normalization'))
+        except ValueError as error:
+            raise ValueError(f'{path}: {error}') from error
         version = manifest.get('output_version')
         if version not in (3, 4, 5, 6):
             raise ValueError(f'Unsupported analysis output_version {version!r} in {root}/run.json; '

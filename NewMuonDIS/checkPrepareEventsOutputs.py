@@ -8,10 +8,10 @@ The argument contains numbered Ganga master-job directories.  The script
 discovers each job's ``JOB_ID/SUBJOB_ID/output/stdout`` files, reads the EOS
 destination recorded by Ganga, and does not modify files.
 
-By default, only local logs and output-location records are read; ROOT files
-are not opened. Add --metadata for tree-header normalization records only,
-or --check-root to validate outputs and include ROOT-derived
-entry counts, muon weights, and DIS statistics.
+Every included output must have complete prepareEvents normalization metadata.
+The default check reads ROOT headers without scanning event branches. Add
+--metadata to print normalization totals, or --check-root to include
+ROOT-derived entry counts, muon weights, and DIS statistics.
 
 All recorded ROOT outputs excluded from the summary statistics are written as
 safely quoted ``rm`` commands to an executable ``rmcommand.sh`` in the current
@@ -151,7 +151,34 @@ def read_normalization(tree):
         if identity in records and records[identity] != record:
             raise ValueError('conflicting normalization UUID')
         records[identity] = record
-    return {'complete': bool(complete and complete.GetVal()), 'records': records}
+    return {'complete': bool(complete and complete.GetVal() == 1), 'records': records}
+
+
+class PreparationMetadataError(ValueError):
+    """An output cannot be used because its preparation provenance is missing."""
+
+
+def require_preparation_metadata(metadata):
+    """Require completed preparation records in ROOT or analysis metadata."""
+    if not isinstance(metadata, dict):
+        raise PreparationMetadataError('missing preparation metadata')
+    if metadata.get('complete', metadata.get('preparation_complete')) is not True:
+        raise PreparationMetadataError('incomplete preparation metadata')
+    records = metadata.get('records', {})
+    records = list(records.values()) if isinstance(records, dict) else records
+    if not isinstance(records, list):
+        raise PreparationMetadataError('invalid preparation metadata records')
+    prepared = [record for record in records if isinstance(record, dict)
+                and record.get('stage') == 'prepareEvents']
+    if not prepared:
+        raise PreparationMetadataError('missing prepareEvents normalization record')
+    for record in prepared:
+        for key in ('input_muons', 'sum_weights', 'sum_weights_squared'):
+            value = record.get(key)
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or (key != 'sum_weights' and value < 0)
+                    or (key == 'input_muons' and type(value) is not int)):
+                raise PreparationMetadataError(f'invalid preparation metadata field {key}')
 
 
 def print_extra_statistics(results):
@@ -270,7 +297,8 @@ def parse_stdout(text, output):
     }
 
 
-def root_statistics(filename, weights_only=False, metadata_only=False, include_metadata=False):
+def root_statistics(filename, weights_only=False, metadata_only=False, include_metadata=False,
+                    tree_name='MuonDIS'):
     """Open a MuonDIS output and return its counts, or a diagnostic string."""
     try:
         import ROOT
@@ -287,13 +315,16 @@ def root_statistics(filename, weights_only=False, metadata_only=False, include_m
             with redirect_stderr(diagnostics):
                 try:
                     if metadata_only:
-                        status, result = read_root_statistics(ROOT, filename, metadata_only=True)
+                        status, result = read_root_statistics(ROOT, filename, metadata_only=True,
+                                                              tree_name=tree_name)
                     elif include_metadata:
                         status, result = read_root_statistics(ROOT, filename, include_metadata=True)
                     elif weights_only:
                         status, result = read_root_statistics(ROOT, filename, weights_only=True)
                     else:
                         status, result = read_root_statistics(ROOT, filename)
+                except PreparationMetadataError as error:
+                    status, result = str(error), None
                 except (OSError, RuntimeError, ValueError, OverflowError) as error:
                     status, result = f'corrupt or unreadable ROOT file ({error})', None
                 finally:
@@ -334,7 +365,8 @@ def read_muon_weight_sum(tree):
     return math.fsum(totals)
 
 
-def read_root_statistics(ROOT, filename, weights_only=False, metadata_only=False, include_metadata=False):
+def read_root_statistics(ROOT, filename, weights_only=False, metadata_only=False, include_metadata=False,
+                         tree_name='MuonDIS'):
     """Read the statistics while root_statistics monitors ROOT diagnostics."""
     root_file = ROOT.TFile.Open(filename, 'READ')
     if not root_file:
@@ -344,13 +376,15 @@ def read_root_statistics(ROOT, filename, weights_only=False, metadata_only=False
             return 'corrupt or unreadable ROOT file', None
         if root_file.TestBit(ROOT.TFile.kRecovered):
             return 'corrupt ROOT file (recovered keys)', None
-        tree = root_file.Get('MuonDIS')
+        tree = root_file.Get(tree_name)
         if not tree or not tree.InheritsFrom('TTree'):
-            return 'corrupt ROOT file (missing MuonDIS tree)', None
+            return f'corrupt ROOT file (missing {tree_name} tree)', None
+        normalization = read_normalization(tree)
+        require_preparation_metadata(normalization)
         if metadata_only:
             return 'successful', {'written': int(tree.GetEntries()),
-                                  'normalization': read_normalization(tree)}
-        metadata = {'normalization': read_normalization(tree)} if include_metadata else {}
+                                  'normalization': normalization}
+        metadata = {'normalization': normalization} if include_metadata else {}
         weighted_muons = read_muon_weight_sum(tree)
         if weights_only:
             return 'successful', {'written': int(tree.GetEntries()),
@@ -443,9 +477,9 @@ def main():
                         help='Number of consecutive master jobs to check')
     parser.add_argument('--check-root', action='store_true',
                         help='Open and check all recorded ROOT outputs and read their statistics '
-                             '(default: fast, local logs only)')
+                             '(default: logs and ROOT headers only)')
     parser.add_argument('--metadata', action='store_true',
-                        help='Read ROOT headers and normalization metadata, without scanning event branches')
+                        help='Print normalization totals (preparation metadata is always checked)')
     args = parser.parse_args()
     base = args.path.expanduser()
     if not base.is_dir():
@@ -491,18 +525,18 @@ def main():
             except OSError as error:
                 log_status, log_result = f'unreadable stdout ({error})', None
             root_status, root_result = None, None
-            if args.check_root or args.metadata:
+            if outputs:
                 # Failed/incomplete worker logs can still have a transferred file.
                 # Check it as well so corrupt outputs are not silently omitted.
                 for filename in outputs:
-                    if args.metadata:
+                    if not args.check_root or args.metadata:
                         root_status, root_result = root_statistics(
                             filename, metadata_only=not args.check_root, include_metadata=args.check_root)
                     else:
                         root_status, root_result = root_statistics(filename)
                     if root_result is None:
                         problems.append(f'{label}: {root_status}: {filename}')
-            if log_result is None or ((args.check_root or args.metadata) and root_result is None):
+            if log_result is None or root_result is None:
                 # Count each excluded subjob once; retain additional ROOT
                 # diagnostics in the detailed problems list below.
                 status = log_status if log_result is None else root_status
@@ -516,8 +550,7 @@ def main():
                 excluded_outputs.extend(outputs)
                 continue
             statuses['successful'] += 1
-            if args.check_root or args.metadata:
-                log_result.update(root_result)
+            log_result.update(root_result)
             results.append(log_result)
             timings.append(read_job_timing(logfile, log_text))
             included_outputs.add(eos_path(output) or output)
@@ -527,13 +560,12 @@ def main():
     success_rate = (f'{100 * len(results) / discovered_subjobs:.2f}%'
                     if discovered_subjobs else 'undefined')
     success_label = ('Successful subjobs with valid ROOT output' if args.check_root
-                     else 'Successful subjobs according to logs')
+                     else 'Successful subjobs with ROOT headers checked')
     print(f'{success_label}: {len(results)}/{discovered_subjobs} '
           f'({success_rate})')
-    if args.metadata and not args.check_root:
-        print('Metadata mode: ROOT headers checked; event baskets not validated.')
-    elif not args.check_root:
-        print('Fast mode: ROOT outputs not checked; use --check-root for validation and ROOT statistics.')
+    print('Complete preparation metadata required for every included output.')
+    if not args.check_root:
+        print('ROOT headers checked; event baskets not validated. Use --check-root for ROOT statistics.')
     print(f'Excluded subjobs: {discovered_subjobs - len(results)} '
           '(one primary reason per subjob below)')
     for status, count in sorted(statuses.items()):

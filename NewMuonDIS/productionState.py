@@ -16,7 +16,7 @@ import uuid
 VERSION = 1
 TERMINAL = {'completed', 'failed', 'killed'}
 MUTABLE_SETTINGS = {'n_jobs', 'max_runtime', 'site', 'skip_existing',
-                    'resubmit_incomplete', 'retry_failed', 'state_file'}
+                    'resubmit_incomplete', 'retry_failed', 'state_file', 'allow_partial'}
 
 
 def timestamp():

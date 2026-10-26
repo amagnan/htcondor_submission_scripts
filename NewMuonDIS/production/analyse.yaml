@@ -3,8 +3,9 @@ tag: TRY2026
 production: 261021
 # Outputs: output_dir/analysis/analysis_name/<source-hash>/[subjob]/analysis_evt*.tar.gz
 analysis_name: replay_gen_v6
-# input_dir defaults to P; only *_disreplay_gen_filtered.root files are selected.
-masters_per_job: 10  # Ten unsplit filter jobs' outputs, one per disgen file.
+# Fixed batch exported from completed replayfilter jobs 3671–3682.
+#analysis_inputs: analysis_inputs_261021_first12.json
+masters_per_job: 1  # Twelve filtered outputs, one per disgen file.
 n_jobs: -1
 n_subjobs: 1
 events_per_file: -1
@@ -15,7 +16,7 @@ analysis:
   weight_factor: 3.6e-6
   target_sum_weights: 6241572595.8004637
   failed_job_factor: 1.0
-  geometry_file: null  # Use the geometry transferred with each filtered input.
+  geometry_file: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
 # Each axis specifies [minimum_cm, maximum_cm, number_of_bin_edges].
   plot_axes:
     x: [-500, 500, 500]

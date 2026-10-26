@@ -55,6 +55,7 @@ Each YAML contains exactly one `step`. All other settings have defaults:
 | replay_type, geometry_file | replayfilter: disreplay_gen (or disreplay_filter), optional shared geometry override |
 | files_per_job | Analysis only: positive number of input files per job, default 1; CLI override: --files-per-job |
 | skip_existing | Skip complete output sets, default true; false restores the stop-on-existing-output behavior |
+| allow_partial | Default true: skip inputs missing complete preparation metadata and log every skipped path. False stops planning; CLI: `--allow-partial` / `--require-complete-inputs` |
 | resubmit_incomplete | Default false: preserve empty/partial outputs and skip their ranges. True opts into cleanup and resubmission |
 | state_file | Optional JSON manifest path for persistent plans, Ganga IDs and attempt history; default null (file-based mode) |
 | retry_failed | With state_file, include tracked failed/killed ranges; default false |
@@ -354,7 +355,8 @@ merging these reduced directories later. The checker accepts an empty
 Failed/missing jobs prevent merging by default. `--merge-successful` explicitly
 allows merging valid outputs only, but the checker still returns a nonzero
 status to report the omitted jobs. Incompatible or overlapping valid inputs
-always block merging. `checkReplay.py` retains its simulation-log behavior.
+always block merging. Every checker excludes outputs without complete preparation
+metadata; `checkAnalysis.py` validates the normalization stored in `run.json`.
 
 ## Preparation diagnostics and metadata
 
@@ -364,20 +366,39 @@ older raw-counter logs. It reports path-length means as ratios of combined
 additive totals, not averages of per-job means. `ALL` excludes `REST`, and
 per-material means count only crossing muons.
 
-The default check reads local logs only. Add `--metadata` to open each ROOT
-file once and read `MuonDIS` entries and `muDIS_normalization` from tree headers,
-without reading event baskets. The summary deduplicates records by UUID and
-reports input muons, sum of weights and sum of squared weights by stage.
-Missing legacy metadata is reported as unavailable, not as zero normalization.
+Every checker requires complete preparation metadata, including at least one
+`prepareEvents` normalization record. ROOT checkers read tree headers by default;
+missing or incomplete metadata excludes the file from counts and exports and
+prints its path and reason. `--metadata` adds the detailed normalization printout.
+The summary deduplicates records by UUID and reports input muons, sum of weights
+and sum of squared weights by stage.
 These input weights are measured before selection and differ from weights of
 written muons.
 
 `--check-root` retains the deeper branch scans for written muon weights and DIS
 counts. Combine it with `--metadata` to report both in a single file open.
 Metadata-only checks do not establish that event baskets are readable. No EOS
-latency benchmark is assumed; ROOT access remains opt-in. The existing
+latency benchmark is assumed. The existing
 `rmcommand.sh` generation behavior is retained; the checker never executes it.
 
+
+Downstream input selection (`disfilter`, `disreplay_gen`, `disreplay_filter`,
+`replayfilter`, and `analyse`) applies the same ROOT-header check before planning.
+When the launcher cannot import PyROOT (as with the CVMFS Ganga installation),
+the planner automatically starts one metadata reader in the configured
+`fs_install` workspace via `pixi-cvmfs`. Ganga keeps its own Python interpreter;
+continue using `./gangaSubmit.sh production/analyse.yaml --submit` as usual.
+Failure to start the reader stops planning instead of skipping every input.
+By default, `allow_partial: true` skips invalid inputs and prints every skipped
+path and reason, including without `--verbose`. Use `--require-complete-inputs`
+or `allow_partial: false` to stop instead. `--allow-partial` overrides a strict YAML.
+
+New analysis chains are grouped after excluding invalid files. Replayfilter skips
+an entire prepared-file master if any replay member is invalid. Saved groups are
+rechecked on every preview/resume and skipped as whole groups; their inputs and
+output identities are never silently shortened. Checked input JSON files are
+also revalidated. The checkers still return nonzero when any output is excluded;
+their exported JSON contains only accepted outputs.
 
 ## Producing in batches and repairing missing ranges
 

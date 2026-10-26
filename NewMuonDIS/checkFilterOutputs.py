@@ -8,6 +8,7 @@ import math
 import re
 import shlex
 import statistics
+import sys
 
 from checkPrepareEventsOutputs import output_locations, root_statistics
 
@@ -93,7 +94,6 @@ def main():
     results = []
     excluded = []
     weighted_results = []
-    weight_problems = []
     for job_id in range(args.first_job, args.first_job + args.num_jobs):
         logfile = base / str(job_id) / 'output/stdout'
         try:
@@ -108,26 +108,25 @@ def main():
                 and result['filter_option'] != args.filter_option):
             excluded.append(f"{job_id}: filter option {result['filter_option']}")
             continue
-        statuses[status] += 1
         if result is not None:
-            results.append(result)
             destinations = re.findall(r'^Output copy completed: (.+)$', log_text, re.MULTILINE)
             try:
                 if not destinations:
                     destinations = output_locations(base / str(job_id))
                 if len(destinations) != 1:
-                    weight_problems.append(f'{job_id}: missing or ambiguous ROOT output path')
-                    continue
+                    raise ValueError('missing or ambiguous ROOT output path')
                 weight_status, weights = root_statistics(destinations[0], weights_only=True)
                 if weights is None:
-                    weight_problems.append(f'{job_id}: {weight_status}')
+                    raise ValueError(f'{destinations[0]}: {weight_status}')
                 elif weights['written'] != result['selected']:
-                    weight_problems.append(f'{job_id}: ROOT entries differ from selected log count')
+                    raise ValueError(f'{destinations[0]}: ROOT entries differ from selected log count')
                 else:
                     weighted_results.append(weights['weighted_muons'])
-            except OSError as error:
-                weight_problems.append(f'{job_id}: cannot read output locations ({error})')
-        else:
+                    results.append(result)
+            except (OSError, ValueError) as error:
+                status, result = str(error), None
+        statuses[status] += 1
+        if result is None:
             problems.append(f'{job_id}: {status}')
             try:
                 destinations = output_locations(base / str(job_id))
@@ -138,6 +137,7 @@ def main():
             except OSError as error:
                 problems.append(f'  Output: cannot read output locations ({error})')
     print(f'Jobs {args.first_job}–{args.first_job + args.num_jobs - 1}')
+    print('Complete preparation metadata required for every included output.')
     if args.filter_option is not None:
         print(f'Filter option: {args.filter_option}; excluded other-option jobs: {len(excluded)}')
     print(f'Successful jobs with complete summaries: {len(results)}/{args.num_jobs} '
@@ -156,8 +156,6 @@ def main():
         print(f'Muon weights available for {len(weighted_results)}/{len(results)} successful jobs.')
         if weighted_results:
             print_stats('Muons selected weighted', weighted_results)
-        if weight_problems:
-            print('WARNING: weighted-muon statistics use only jobs with readable, matching ROOT output.')
         processed = sum(result['processed'] for result in results)
         selected = sum(result['selected'] for result in results)
         print(f'Muon selection: {selected}/{processed}'
@@ -179,10 +177,8 @@ def main():
     if excluded:
         print('\nExcluded jobs (different filter option):')
         print('\n'.join(excluded))
-    if weight_problems:
-        print('\nJobs with unavailable muon weights:')
-        print('\n'.join(weight_problems))
+    return int(bool(problems) or not results)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
