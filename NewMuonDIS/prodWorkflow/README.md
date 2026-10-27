@@ -4,10 +4,20 @@ Configure a campaign once in `workflow.yaml`, then submit/check one stage at a
 time. The root `../gangaSubmit.sh` and this directory's `gangaSubmit.sh` both use
 this workflow. There is no legacy CLI/configuration translation.
 
-```text
-disgen ────────────────────> disreplay_gen ────> replayfilter ────> analysis ────> merger
-   └──> disfilter ────> disreplay_filter ────────────┘
+```mermaid
+flowchart TD
+    INPUT[CUDA muon inputs] --> GEN[disgen]
+    GEN -->|check| REPLAY[disreplay_gen]
+    GEN -->|check; optional branch| DISFILTER[disfilter]
+    DISFILTER -->|check| FILTERREPLAY[disreplay_filter]
+    REPLAY -->|check; complete replay masters| FILTER[replayfilter: one unsplit chain per prepared file]
+    FILTERREPLAY -.->|check; select this upstream instead| FILTER
+    FILTER -->|check; filtered ROOT, geometry and manifest| ANALYSIS[analysis: one filtered input per master by default]
+    ANALYSIS -->|check; approved archives| MERGER[merger: local merge and plots]
 ```
+
+See the [detailed workflow and output layout](../production/directory-structure.md)
+for checker exports, replayfilter outputs and analysis splitting.
 
 Only disgen discovers files. Every subsequent stage consumes the saved output
 list from its upstream checker. Submission uses saved entry counts and cheap

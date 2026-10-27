@@ -98,9 +98,10 @@ original arguments, and existing outputs are still skipped by default.
 
 ## Splitting and output layout
 
-See the [directory-flow diagram](directory-structure.md) for generation with
-20 × 12,500-entry subjobs, filtering, and both replay modes, including exact
-output filenames and the separate Ganga log layout.
+See the [current workflow diagram](directory-structure.md) for the `prodWorkflow`
+stages, including replayfilter, analysis and local merging. Its checked-input
+workflow and output layout supersede the older configuration described below;
+see [prodWorkflow/README.md](../prodWorkflow/README.md) for current commands.
 
 Each new ROOT input normally creates its own Ganga job. Partial repairs use one
 unsplit job per missing range, preserving its original destination. For filtering and replay,

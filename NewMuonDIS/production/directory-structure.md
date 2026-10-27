@@ -1,56 +1,89 @@
-# DIS production and chained replay filtering
+# DIS analysis workflow and output layout
 
-Let `P = output_base/tag/production` (261021 in the supplied replay/filter/analysis
-YAMLs), `C` identify a CUDA input, `g` a generation subjob, and `r` a replay subjob.
+This diagram describes the current [prodWorkflow setup](../prodWorkflow/README.md),
+configured by `prodWorkflow/workflow.yaml` and the stage YAMLs beside it.
+Both `gangaSubmit.sh` entry points use this workflow. Older `production/*.yaml`
+examples use a different configuration and directory layout.
 
 ```mermaid
 flowchart TD
-    GEN[disgen master for C] --> DIS[Disgen file P/C/g/muonDis_S_disgen.root]
-    DIS --> REPLAY[disreplay_gen master with replay subjobs r]
-    REPLAY --> INPUTS[Replay files P/C/g/r/sim_muonDis_S_evta_b_disreplay_gen.root]
-    INPUTS --> FILTER[One unsplit replayfilter job per disgen file; one TChain]
-    FILTER --> OUT[P/C/g/muonDis_S_disreplay_gen_filtered.root]
-    OUT --> ANALYSIS[analyse: ten filtered files per unsplit job]
+    INPUT[CUDA muon inputs] --> GEN[disgen: prepareEvents.py]
+    GEN --> GC[check disgen: approved prepared ROOT files]
+    GC --> RG[disreplay_gen: replay each prepared file in ranges]
+    GC --> DF[Optional disfilter: filterEvents.py]
+    DF --> DC[check disfilter: approved filtered DIS files]
+    DC --> RF[disreplay_filter: replay each filtered DIS file in ranges]
+    RG --> RC[check replay: every planned range of a logical master must succeed]
+    RF -.->|select this upstream instead| RC
+    RC --> CHAIN[replayfilter: one unsplit job per prepared DIS file; all replay ranges in one TChain]
+    CHAIN --> FILTERED[Filtered ROOT file, companion geometry and JSON manifest]
+    FILTERED --> FC[check replayfilter: validate transfers, counts and provenance]
+    FC --> ANALYSIS[analysis: analyseEvents.py; one filtered input per master by default]
+    ANALYSIS --> ARCHIVE[analysis_evtSTART_END.tar.gz per analysis range]
+    ARCHIVE --> AC[check analysis: validate archives and provenance]
+    AC --> MERGE[merger: mergeAnalysis.py locally in FairShip Pixi]
+    MERGE --> RESULT[Merged histograms, cutflows, normalization and plots]
 ```
+
+Each `check` writes `checked.json`; the next stage consumes only that saved,
+approved input list. Only disgen discovers files. By default,
+`require_complete: true` waits for all planned upstream ranges. Even with
+`require_complete: false`, replayfilter never receives an incomplete replay
+master. Successful retry ranges can complete a logical master across several
+Ganga job IDs.
+
+The default replayfilter upstream is `disreplay_gen`. To use the optional branch,
+set `upstream: disreplay_filter` before submission. The two replay branches are
+alternatives for one replayfilter stage; running both requires separately named
+replayfilter, analysis and merger stages as described in the workflow README.
+
+Replayfilter combines all checked replay splits from one prepared DIS file.
+It preserves accepted events' branches and deduplicates shared preparation
+normalization. ROOT schemas and companion geometries must agree across the
+chain. The JSON manifest records source provenance and selection counts;
+auxiliary ROOT objects are retained under `replay_sources/<source-index>/`.
+
+Analysis inherits the replay type from the checked filter provenance. Its
+default is one filtered input per Ganga master, with one range; set
+`events_per_subjob` or `n_subjobs` to split that input further. Each archive
+includes `events.jsonl`. The local merger defaults to `skip_event_records: true`
+and `save_plots: true`, retaining the original archives while merging summaries
+and rendering plots.
+
+Let `P = OUTPUT_BASE/TAG/PRODUCTION/MODE`, where `MODE` is `production` or `test`.
+`STEP_NAME` defaults to the stage name, and `GROUP`, `ATTEMPT` and `RANGE` are
+workflow identifiers. Each batch attempt has its own output directory:
 
 ```text
 P/
-├── C/
-│   └── g/
-│       ├── muonDis_S_disgen.root
-│       ├── 0/
-│       │   ├── sim_muonDis_S_evt0_1000_disreplay_gen.root
-│       │   └── geo_muonDis_S_evt0_1000_disreplay_gen.root
-│       ├── 1/
-│       │   ├── sim_muonDis_S_evt1000_all_disreplay_gen.root
-│       │   └── geo_muonDis_S_evt1000_all_disreplay_gen.root
-│       ├── muonDis_S_disreplay_gen_filtered.root
-│       ├── geo_muonDis_S_disreplay_gen_filtered.root
-│       └── muonDis_S_disreplay_gen_filtered.json
-└── analysis/replay_gen_v6/
-    └── <ordered-source-path-hash>/
-        └── analysis_evt0_all.tar.gz
+├── disgen/GROUP/ATTEMPT/RANGE/
+│   └── muonDis_TAG_GROUP_evtSTART_END_disgen.root
+├── disreplay_gen/GROUP/ATTEMPT/RANGE/
+│   ├── sim_muonDis_TAG_GROUP_evtSTART_END_disreplay_gen.root
+│   ├── params_muonDis_TAG_GROUP_evtSTART_END_disreplay_gen.root
+│   └── geo_muonDis_TAG_GROUP_evtSTART_END_disreplay_gen.root
+├── replayfilter/GROUP/ATTEMPT/RANGE/
+│   ├── muonDis_TAG_GROUP_evtSTART_END_disreplay_gen_filtered.root
+│   ├── geo_muonDis_TAG_GROUP_evtSTART_END_disreplay_gen_filtered.root
+│   └── muonDis_TAG_GROUP_evtSTART_END_disreplay_gen_filtered.json
+├── analysis/GROUP/ATTEMPT/RANGE/
+│   └── analysis_evtSTART_END.tar.gz
+└── merger/
+    ├── merged/
+    └── merged_inputs/
+
+STATE_DIR/TAG/PRODUCTION/MODE/STEP_NAME/
+├── state.json
+├── checked.json                  # Written by check for batch stages
+└── tasks/ATTEMPT/task-UNIT.json
 ```
 
-A filter job has **no Ganga subjobs**. It consumes all replay files belonging
-to one prepared file, including all replay splits. It retains the prepared
-file's directory and basename, replacing `_disgen` with `_disreplay_gen_filtered`.
-Its local log is `GANGADIR/<filter-job-id>/output/stdout`.
+The optional branch adds `disfilter` and `disreplay_filter` stage directories;
+its replayfilter outputs use `_disreplay_filter_filtered` instead. Custom stage
+names replace the corresponding directory names. Retries write fresh attempt
+directories, and the checker exports only the newest accepted attempt per range.
+Ganga IDs and subjob IDs are recorded in state; they are not the output path IDs.
 
-The companion geometry is copied once after verifying consistency across the
-chain. ROOT schemas must match. Output tree normalization combines records
-from every input without counting shared preparation records more than once.
-Per-source UUIDs, ranges and counts are saved in the JSON manifest; auxiliary
-ROOT objects are retained in `replay_sources/<source-index>/`.
-
-`masters_per_job: 10` now means ten filter jobs' outputs, hence ten disgen files.
-Analysis discovers the new suffix under `P` and stages aliases for FairShip.
-A final analysis job may contain fewer than ten files. Use a state file to
-freeze groups when running in batches; choose a fresh state for this layout.
-
-`--test` reads at most 100 chain entries and writes
-`muonDis_S_disreplay_gen_filtered_test.root` beside the prepared file.
-Normal analysis discovery excludes test outputs. `checkReplayFilter.py` reports transfer
-completeness, event efficiency and ROOT byte reduction. `checkAnalysis.py`
-checks version-6 archives, including empty `events.jsonl`, and supports
-`--skip-event-records` for summary-only merging. See [README.md](README.md).
+`--test` uses separate state and output directories, selects one input/master,
+and processes at most 100 entries (2 for replay). Replayfilter remains unsplit.
+Test and production checker exports cannot be mixed.
