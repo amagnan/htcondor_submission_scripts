@@ -1,8 +1,9 @@
 # Run locally through the same entry point: ./gangaSubmit.sh merger.yaml --submit.
 step: merger
 # upstream: analysis
-skip_event_records: true      # Do not extract or merge the large events.jsonl.
-save_plots: true              # false keeps tables/histograms without rendering.
+skip_event_records: false     # Required for tree-only inputs; fast ROOT basket merging.
+summarize: true               # After tree-only merging, write MERGE_OUTPUT_summary.
+save_plots: true              # Render in the summary; false still writes tables/histograms.
 # merge_output: null          # Default: OUTPUT_BASE/TAG/PRODUCTION/MODE/merger/merged.
 # unpack_dir: null            # Default: merge_output + "_inputs"; retained for provenance.
 # Explicit merge_output/unpack_dir get a "_test" suffix with --test.

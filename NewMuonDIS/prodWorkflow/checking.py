@@ -63,6 +63,8 @@ def inspect(settings, group, unit, attempt, full=False):
             raise ValueError('Analysis log and archive names differ')
         checkAnalysis.validate_analysis_sources([result])
         manifest = result['manifest']
+        if manifest.get('tree_only', False) != spec['analysis'].get('tree_only', False):
+            raise ValueError('Analysis output mode differs from its task')
         if (manifest['entries_processed'] != spec['count'] or manifest['chain_entry_start'] != spec['first']
                 or [local_path(p) for p in manifest['files']] != spec['sources']):
             raise ValueError('Analysis provenance/range differs from its task')

@@ -13,7 +13,8 @@ flowchart TD
     REPLAY -->|check; complete replay masters| FILTER[replayfilter: one unsplit chain per prepared file]
     FILTERREPLAY -.->|check; select this upstream instead| FILTER
     FILTER -->|check; filtered ROOT, geometry and manifest| ANALYSIS[analysis: one filtered input per master by default]
-    ANALYSIS -->|check; approved archives| MERGER[merger: local merge and plots]
+    ANALYSIS -->|check; archives containing events.root| MERGER[merger: fast ROOT tree merge locally]
+    MERGER --> SUMMARY[summarizeAnalysis.py: histograms, cutflows and plots once]
 ```
 
 See the [detailed workflow and output layout](../production/directory-structure.md)
@@ -58,7 +59,8 @@ From this directory:
 Omit `--test` for production, starting again at disgen. Test and production have
 different state and output directories. A test selects one input/master and
 at most 100 entries (2 for replay); it never reads a production checker export.
-The merger runs locally in the FairShip Pixi environment, not as a Ganga job.
+The merger and its subsequent summary run locally in the FairShip Pixi environment,
+not as Ganga jobs.
 Checks also run there automatically when called through `gangaSubmit.sh`.
 
 The same commands work from the repository root with `prodWorkflow/` prepended
@@ -174,18 +176,52 @@ merger_filter:       step=merger,       upstream=analysis_filter
 ## Disk space, merging and interactive diagnosis
 
 Analysis defaults to one replayfilter master per Ganga master. Set
-`events_per_subjob` in `analysis.yaml` to split further. FairShip currently
-always writes the detailed `events.jsonl`; this workflow does not change that
-format. `disk_mb` makes the disk request explicit, but the batch site's maximum
-still applies. The setting is a request, not a guarantee of usable quota.
+`events_per_subjob` in `analysis.yaml` to split further. The default
+`analysis.tree_only: true` extracts version-7 `events.root`, containing the `DIS`
+TTree with one entry per filtered replay event, plus `normalization.csv` and the
+small completion/provenance manifest `run.json`. Jobs defer histogram filling
+and plot rendering. All outputs still transfer in one `analysis_evt*.tar.gz`.
+`disk_mb` makes the disk request explicit, but the batch site's maximum still
+applies. The setting is a request, not a guarantee of usable quota.
 
-`merger.yaml` defaults to `skip_event_records: true`. The existing merger combines
-histograms, per-step/per-material cutflows, pair/tagger summaries and normalization
-without extracting or duplicating `events.jsonl`. Original archives remain
-available. Scanning compressed archives still takes I/O. Extracted small inputs
-are retained for provenance. Set `save_plots: false` to omit rendering too.
-An explicit merge destination must be new/empty. Partial merges require
-`require_complete: false`; the record lists exactly which archives were used.
+`merger.yaml` now defaults to `skip_event_records: false` and `summarize: true`.
+It unpacks the checked archives and invokes FairShip's `mergeAnalysis.py`, which
+validates tree schemas, entry counts and small provenance/stage branches, then
+copies compressed ROOT baskets without decoding/re-encoding the track/hit payload.
+It then runs `summarizeAnalysis.py` on the merged tree to fill histograms,
+per-stage/per-material cutflows, pair/tagger summaries and normalization once.
+The default destinations are `merger/merged` for the tree and manifest,
+`merger/merged_summary` for summaries and plots, and `merger/merged_inputs` for
+retained unpacked inputs. Original archives remain available. Archive unpacking
+still takes I/O; summarizing still reads the events and fills histograms.
+
+Set `save_plots: false` in `merger.yaml` to write summaries without rendering.
+Set `summarize: false` to perform only the tree merge. To summarize later (or
+retry a failed summary), run from the FairShip installation:
+
+```bash
+pixi cvmfs python -u newMuonDIS/summarizeAnalysis.py /path/to/merged \
+    --output-dir /path/to/new_summary --no-plots
+```
+
+The merge is recorded before summarization, so a summary failure leaves the
+merged tree available. Choose a new/empty summary directory for the retry;
+rerunning the whole merger into the existing merge destination is rejected.
+Omit `--no-plots` to render plots. Use the same FairShip analysis code for
+extraction and summary; selection-code changes require re-extraction.
+
+For combined tree/histogram jobs, set `analysis.tree_only: false`. Those outputs
+merge directly, without a separate summary invocation; only that mode supports
+`skip_event_records: true` to omit `events.root`. Tree-only and combined outputs
+cannot be mixed. Version-5/6 JSON outputs must be regenerated for the current
+FairShip merger. Use fresh analysis and merger step names (and connect their
+`upstream` values) or a new campaign when changing an existing production to
+version 7; checked replayfilter inputs can be reused.
+
+Merge and summary destinations must be new/empty. Partial merges require
+`require_complete: false`; state records the exact input archives and, after a
+successful summary, its output directory. Archive checks validate structure and
+manifests without opening ROOT; the merger performs tree validation.
 
 `--verbose` prints a fresh-directory interactive command for each planned task.
 The task JSON contains ordinary paths and arguments, with no base64 payload.
@@ -205,6 +241,7 @@ bash -n gangaSubmit.sh prodWorkflow/gangaSubmit.sh
 The workflow tests use temporary local files and a fake Ganga API. They cover
 checked-only inputs, finite splitting, metadata caching, complete replay groups,
 nonconsecutive job IDs, failed-range repair, durable submission reservations,
-test isolation, readable workers and merge omission. They do not run simulation
+test isolation, readable workers, version-7 archives, tree retention/omission and
+the merge-to-summary handoff. They do not run simulation
 or submit jobs. Real FairShip/Condor smoke testing remains an explicit test
 campaign using the commands above.

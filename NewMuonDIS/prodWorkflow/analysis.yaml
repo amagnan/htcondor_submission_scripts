@@ -2,8 +2,9 @@
 step: analysis
 # upstream: replayfilter
 analysis:
+  tree_only: true            # Extract events.root; fill histograms once after merging.
   weight_factor: 3.6e-6
-  target_sum_weights: null    # null = no target scaling; set the full-production muon weight sum.
+  target_sum_weights: 6241572595.8004637    # null = no target scaling; set the full-production muon weight sum.
   # failed_job_factor: 1.0
   # save_plots: false         # Render once at merge time.
   # geometry_file: null       # Checked companion geometry; an absolute override is supported.
@@ -12,7 +13,7 @@ analysis:
   #   y: [-500, 500, 500]
   #   z: [2000, 10000, 800]
 # type is inherited from replayfilter provenance, never supplied manually.
-# Current FairShip analysis always writes events.jsonl. Split further if needed.
+# Version 7 writes events.root (DIS TTree) and a small run.json manifest.
 
 # first_event: 0               # Zero-based entry; applies to each checked input.
 # events_per_file: -1          # All remaining CHECKED entries; finite values cap the range.

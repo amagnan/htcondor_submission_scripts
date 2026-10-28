@@ -2,7 +2,7 @@ step: analyse
 tag: TRY2026
 production: 261021
 # Outputs: output_dir/analysis/analysis_name/<source-hash>/[subjob]/analysis_evt*.tar.gz
-analysis_name: replay_gen_v6
+analysis_name: replay_gen_v6_bis
 # Fixed batch exported from completed replayfilter jobs 3671–3682.
 #analysis_inputs: analysis_inputs_261021_first12.json
 masters_per_job: 1  # Twelve filtered outputs, one per disgen file.

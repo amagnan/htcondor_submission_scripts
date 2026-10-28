@@ -51,20 +51,28 @@ def read_analysis_archive(filename):
         except ValueError as error:
             raise ValueError(f'{path}: {error}') from error
         version = manifest.get('output_version')
-        if version not in (3, 4, 5, 6):
+        if version not in (3, 4, 5, 6, 7):
             raise ValueError(f'Unsupported analysis output_version {version!r} in {root}/run.json; '
-                             'expected 3, 4, 5 or 6')
+                             'expected 3, 4, 5, 6 or 7')
         kind = manifest['analysis_signature']['type']
         if kind not in ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter'):
             raise ValueError('Unknown analysis type')
-        required = ['run.json', 'histograms.npz', 'histogram_flows.csv', 'normalization.csv']
-        required += (['cutflow.csv', 'pair_cutflow.csv', 'pair_composition_cutflow.csv']
-                     if kind.startswith('disreplay') else ['vertex_counts.csv'])
-        if kind.startswith('disreplay') and version < 6:
-            required += ['pairs.csv']
+        tree_only = manifest.get('tree_only', False)
+        if type(tree_only) is not bool or (tree_only and (version != 7 or not kind.startswith('disreplay'))):
+            raise ValueError('tree_only requires version-7 replay output')
+        required = ['run.json', 'normalization.csv']
+        if not tree_only:
+            required += ['histograms.npz', 'histogram_flows.csv']
+            required += (['cutflow.csv', 'pair_cutflow.csv', 'pair_composition_cutflow.csv']
+                         if kind.startswith('disreplay') else ['vertex_counts.csv'])
+            if kind.startswith('disreplay') and version < 6:
+                required += ['pairs.csv']
+            if version >= 4 and kind.startswith('disreplay'):
+                required += ['tagger_cutflow.csv']
         if version >= 4 and kind.startswith('disreplay'):
-            required += ['tagger_cutflow.csv']
-            required += ['events.jsonl'] if version >= 6 else ['tagger_tracks.csv']
+            required += ['events.root' if version >= 7 else 'events.jsonl' if version >= 6 else 'tagger_tracks.csv']
+        if set(required) & set(manifest.get('omitted_files', [])):
+            raise ValueError('Required analysis outputs were omitted')
         for name in required:
             member = archive.getmember(root + '/' + name)
             if not member.isfile() or (member.size == 0 and not (
@@ -75,7 +83,7 @@ def read_analysis_archive(filename):
             raise ValueError('Invalid entries_processed')
         if manifest['chain_entry_stop'] - manifest['chain_entry_start'] != processed:
             raise ValueError('Inconsistent chain entry range')
-        if manifest['config'].get('save_plots', True) and not any(
+        if not tree_only and manifest['config'].get('save_plots', True) and not any(
                 name.startswith(root + '/plots/') and name.endswith('.png') for name in names):
             raise ValueError('Requested plots are missing')
     return {'archive': path, 'directory': root, 'manifest': manifest}
@@ -89,6 +97,8 @@ def validate_analysis_sources(results):
     intervals, identities, sizes = {}, {}, {}
     for result in results:
         manifest = result['manifest']
+        if manifest.get('tree_only', False) != reference.get('tree_only', False):
+            raise ValueError('Cannot mix tree-only and histogram outputs')
         if any(manifest[key] != reference[key]
                for key in ('output_version', 'analysis_signature', 'weight_definition')):
             raise ValueError('Incompatible analysis settings/code; check and merge each configuration separately')
@@ -120,6 +130,11 @@ def validate_analysis_sources(results):
 
 def merge_analysis(results, args):
     """Keep unpacked inputs for provenance and invoke FairShip's existing merger."""
+    validate_analysis_sources(results)
+    if args.skip_event_records and any(result['manifest'].get('tree_only', False) for result in results):
+        raise ValueError('Cannot omit event records from a tree-only merge; set skip_event_records: false')
+    if args.skip_tagger_tracks and any(result['manifest']['output_version'] >= 6 for result in results):
+        raise ValueError('Use --skip-event-records for analysis output version 6 or later')
     destination = args.merge_output.expanduser().resolve()
     unpack = (args.unpack_dir or destination.with_name(destination.name + '_inputs')).expanduser().resolve()
     if not args.merger.is_file():
@@ -134,9 +149,8 @@ def merge_analysis(results, args):
     print(f'Retaining merge inputs in {unpack}', flush=True)
     inputs = []
     for index, result in enumerate(results):
-        omitted = 'events.jsonl' if args.skip_event_records else 'tagger_tracks.csv' if args.skip_tagger_tracks else None
-        if args.skip_tagger_tracks and result['manifest']['output_version'] >= 6:
-            raise ValueError('Use --skip-event-records for analysis output version 6')
+        events = 'events.root' if result['manifest']['output_version'] >= 7 else 'events.jsonl'
+        omitted = events if args.skip_event_records else 'tagger_tracks.csv' if args.skip_tagger_tracks else None
         folder = unpack / str(index)
         folder.mkdir()
         with tarfile.open(result['archive'], 'r|gz') as archive:
@@ -257,7 +271,8 @@ def main():
                         help='Skip extracting and merging tagger_tracks.csv; retain original archives '
                              'and merge all histograms and summary tables')
     parser.add_argument('--skip-event-records', action='store_true',
-                        help='Skip extracting/merging events.jsonl; retain histograms and summary tables')
+                        help='Skip extracting/merging events.root (legacy: events.jsonl); '
+                             'retain histograms and summary tables; invalid for tree-only inputs')
     parser.add_argument('--merge-successful', action='store_true',
                         help='Explicitly allow a partial merge of valid jobs')
     args = parser.parse_args()

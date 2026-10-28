@@ -47,9 +47,9 @@ def archive_analysis(directory):
     with (directory / 'run.json').open() as stream:
         manifest = json.load(stream)
     version = manifest.get('output_version')
-    if version not in (3, 4, 5, 6):
+    if version not in (3, 4, 5, 6, 7):
         raise ValueError(f'Unsupported analysis output_version {version!r} in {directory / "run.json"}; '
-                         'expected 3, 4, 5 or 6')
+                         'expected 3, 4, 5, 6 or 7')
     with tarfile.open(str(directory) + '.tar.gz', 'w:gz') as archive:
         archive.add(directory, arcname=directory.name)
 

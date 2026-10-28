@@ -18,11 +18,13 @@ flowchart TD
     RC --> CHAIN[replayfilter: one unsplit job per prepared DIS file; all replay ranges in one TChain]
     CHAIN --> FILTERED[Filtered ROOT file, companion geometry and JSON manifest]
     FILTERED --> FC[check replayfilter: validate transfers, counts and provenance]
-    FC --> ANALYSIS[analysis: analyseEvents.py; one filtered input per master by default]
-    ANALYSIS --> ARCHIVE[analysis_evtSTART_END.tar.gz per analysis range]
+    FC --> ANALYSIS[analysis: analyseEvents.py; tree_only extraction per filtered input]
+    ANALYSIS --> ARCHIVE[analysis_evtSTART_END.tar.gz: events.root DIS tree, run.json, normalization.csv]
     ARCHIVE --> AC[check analysis: validate archives and provenance]
-    AC --> MERGE[merger: mergeAnalysis.py locally in FairShip Pixi]
-    MERGE --> RESULT[Merged histograms, cutflows, normalization and plots]
+    AC --> MERGE[merger: mergeAnalysis.py; fast compressed ROOT basket copy]
+    MERGE --> TREE[Merged events.root and run.json]
+    TREE --> SUMMARY[summarizeAnalysis.py locally; fill histograms once]
+    SUMMARY --> RESULT[Separate summary directory: histograms, cutflows, normalization and plots]
 ```
 
 Each `check` writes `checked.json`; the next stage consumes only that saved,
@@ -45,10 +47,20 @@ auxiliary ROOT objects are retained under `replay_sources/<source-index>/`.
 
 Analysis inherits the replay type from the checked filter provenance. Its
 default is one filtered input per Ganga master, with one range; set
-`events_per_subjob` or `n_subjobs` to split that input further. Each archive
-includes `events.jsonl`. The local merger defaults to `skip_event_records: true`
-and `save_plots: true`, retaining the original archives while merging summaries
-and rendering plots.
+`events_per_subjob` or `n_subjobs` to split that input further. With the default
+`analysis.tree_only: true`, each version-7 archive contains `events.root` (one
+`DIS` tree entry per filtered event), `run.json` and `normalization.csv`.
+The local merger defaults to `skip_event_records: false`, `summarize: true`
+and `save_plots: true`: merge trees first, then fill histograms and render plots
+once with `summarizeAnalysis.py`. The summary retains a reference to the merged
+tree rather than copying it. Archive unpacking and summary filling still take I/O.
+
+Set `summarize: false` to defer summary generation, or `save_plots: false` to
+generate tables/histograms without plots. Combined outputs remain available via
+`analysis.tree_only: false`; only those support `skip_event_records: true`.
+Do not mix modes or version-5/6 JSON archives with version-7 output. See the
+[workflow README](../prodWorkflow/README.md#disk-space-merging-and-interactive-diagnosis)
+for migration and deferred-summary commands.
 
 Let `P = OUTPUT_BASE/TAG/PRODUCTION/MODE`, where `MODE` is `production` or `test`.
 `STEP_NAME` defaults to the stage name, and `GROUP`, `ATTEMPT` and `RANGE` are
@@ -70,6 +82,10 @@ P/
 │   └── analysis_evtSTART_END.tar.gz
 └── merger/
     ├── merged/
+    │   ├── events.root
+    │   ├── run.json
+    │   └── normalization.csv
+    ├── merged_summary/           # Histograms, tables, plots and summary run.json
     └── merged_inputs/
 
 STATE_DIR/TAG/PRODUCTION/MODE/STEP_NAME/

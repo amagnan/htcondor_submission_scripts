@@ -1,6 +1,11 @@
 #!/bin/bash
 
-# Checker-driven production: ./gangaSubmit.sh prodWorkflow/disgen.yaml --test --submit
+# Production: ./gangaSubmit.sh production/disgen.yaml --test --submit
+# Legacy:     ./gangaSubmit.sh --test --submit
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$script_dir/prodWorkflow/gangaSubmit.sh" "$@"
+case "${1-}" in
+    *.yaml|*.yml) script=gangaProdScript.py ;;
+    *) script=gangaScript.py ;;
+esac
+exec /cvmfs/ganga.cern.ch/Ganga/install/ship/bin/ganga "$script_dir/$script" "$@"

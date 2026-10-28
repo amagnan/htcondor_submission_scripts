@@ -286,6 +286,7 @@ class WorkflowTests(unittest.TestCase):
         spec = planned[0]['units'][0]['spec']
         self.assertEqual(spec['analysis']['type'], 'disreplay_gen')
         self.assertFalse(spec['analysis']['save_plots'])
+        self.assertTrue(spec['analysis']['tree_only'])
         scratch = self.base / 'scratch'
         scratch.mkdir()
         cwd = Path.cwd()
@@ -376,39 +377,146 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('INFO: Executing:', result.stdout)
         self.assertIn('Exit code: 0', result.stdout)
 
-    def test_merge_skips_extracting_events_and_records_exact_archives(self):
+    def analysis_archive(self, tree_only=False, entries=3):
         directory = self.base / 'analysis_evt0_3'
         directory.mkdir()
-        manifest = dict(output_version=6,
+        manifest = dict(output_version=7, tree_only=tree_only,
                         normalization=dict(preparation_complete=True, records=[dict(id='prepared-id', **NORMALIZATION['records']['prepared-id'])]),
                         analysis_signature=dict(type='disreplay_gen', sha256='analysis-code'),
-                        config=dict(save_plots=False), entries_processed=3, entries_available=3,
-                        chain_entry_start=0, chain_entry_stop=3, weight_definition='test',
-                        files=['/input.root'], source_ranges=[dict(path='/input.root', file_uuid='file-id', tree='cbmsim', start=0, stop=3, entries=3)])
+                        config=dict(save_plots=False, tree_only=tree_only), entries_processed=entries, entries_available=entries,
+                        chain_entry_start=0, chain_entry_stop=entries, weight_definition='test',
+                        files=['/input.root'], source_ranges=[dict(path='/input.root', file_uuid='file-id', tree='cbmsim', start=0, stop=entries, entries=entries)] if entries else [])
         (directory / 'run.json').write_text(json.dumps(manifest))
-        for name in ('histograms.npz', 'histogram_flows.csv', 'normalization.csv', 'cutflow.csv',
-                     'pair_cutflow.csv', 'pair_composition_cutflow.csv', 'tagger_cutflow.csv', 'events.jsonl'):
+        names = ['normalization.csv', 'events.root']
+        if not tree_only:
+            names += ['histograms.npz', 'histogram_flows.csv', 'cutflow.csv',
+                      'pair_cutflow.csv', 'pair_composition_cutflow.csv', 'tagger_cutflow.csv']
+        for name in names:
             (directory / name).write_text('content\n')
-        archive = self.base / 'analysis.tar.gz'
-        with tarfile.open(archive, 'w:gz') as stream:
-            stream.add(directory, arcname=directory.name)
+        archive = Path(str(directory) + '.tar.gz')
+        worker.archive_analysis(directory)
         analysis = checking.checkAnalysis.read_analysis_archive(str(archive))
         analysis['archive'] = str(analysis['archive'])
-        record = dict(id='analysis-unit', sources=[str(archive)], files=[state.fingerprint(archive)], entries=3, analysis=analysis)
+        return dict(id='analysis-unit', sources=[str(archive)], files=[state.fingerprint(archive)], entries=entries, analysis=analysis)
+
+    def test_merge_skips_extracting_events_and_records_exact_archives(self):
+        record = self.analysis_archive()
+        archive = record['sources'][0]
         self.exported('analysis', [record])
         install = self.base / 'FairShip/newMuonDIS'
         install.mkdir(parents=True)
         (install / 'mergeAnalysis.py').write_text('# test stub; subprocess mocked\n')
-        settings = self.settings('merger', fs_install=str(install.parent), merge_output=str(self.base / 'merged'))
+        settings = self.settings('merger', fs_install=str(install.parent), merge_output=str(self.base / 'merged'),
+                                 skip_event_records=True)
         saved = state.State(settings)
         with patch.object(checking.checkAnalysis.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(workflow.merge(saved, execute=True), 0)
         extracted = self.base / 'merged_inputs/0/analysis_evt0_3'
-        self.assertFalse((extracted / 'events.jsonl').exists())
+        self.assertFalse((extracted / 'events.root').exists())
         self.assertTrue((extracted / 'cutflow.csv').is_file())
-        self.assertEqual(json.loads((extracted / 'run.json').read_text())['omitted_files'], ['events.jsonl'])
+        self.assertEqual(json.loads((extracted / 'run.json').read_text())['omitted_files'], ['events.root'])
         self.assertIn('--skip-event-records', run.call_args.args[0])
         self.assertEqual(json.loads(saved.path.read_text())['merge']['inputs'], [str(archive)])
+
+    def test_tree_only_archive_accepts_zero_events_without_histograms(self):
+        record = self.analysis_archive(tree_only=True, entries=0)
+        checking.checkAnalysis.validate_analysis_sources([record['analysis']])
+        self.assertTrue(record['analysis']['manifest']['tree_only'])
+        self.assertFalse((self.base / 'analysis_evt0_3/histograms.npz').exists())
+
+    def test_version_seven_requires_nonempty_root_even_for_zero_events(self):
+        record = self.analysis_archive(tree_only=True, entries=0)
+        directory = self.base / 'analysis_evt0_3'
+        (directory / 'events.root').write_bytes(b'')
+        worker.archive_analysis(directory)
+        with self.assertRaisesRegex(ValueError, 'empty events.root'):
+            checking.checkAnalysis.read_analysis_archive(record['sources'][0])
+        (directory / 'events.root').unlink()
+        (directory / 'events.jsonl').write_text('old event records')
+        worker.archive_analysis(directory)
+        with self.assertRaisesRegex(KeyError, 'events.root'):
+            checking.checkAnalysis.read_analysis_archive(record['sources'][0])
+
+    def test_mixed_tree_only_and_combined_outputs_rejected(self):
+        result = self.analysis_archive(tree_only=True)['analysis']
+        combined = deepcopy(result)
+        combined['manifest']['tree_only'] = False
+        with self.assertRaisesRegex(ValueError, 'mix tree-only'):
+            checking.checkAnalysis.validate_analysis_sources([result, combined])
+
+    def tree_merge(self, **settings):
+        record = self.analysis_archive(tree_only=True)
+        self.exported('analysis', [record])
+        install = self.base / 'FairShip/newMuonDIS'
+        install.mkdir(parents=True)
+        for script in ('mergeAnalysis.py', 'summarizeAnalysis.py'):
+            (install / script).write_text('# test stub; subprocess mocked\n')
+        return state.State(self.settings('merger', fs_install=str(install.parent),
+                                         merge_output=str(self.base / 'merged'), **settings))
+
+    def test_tree_merge_then_summary_retains_root_and_records_both_outputs(self):
+        saved = self.tree_merge(save_plots=False)
+        with patch.object(workflow.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.merge(saved, execute=True), 0)
+        self.assertEqual(run.call_count, 2)
+        merge_command, summary_command = [call.args[0] for call in run.call_args_list]
+        self.assertTrue(merge_command[1].endswith('/mergeAnalysis.py'))
+        self.assertNotIn('--skip-event-records', merge_command)
+        self.assertTrue(summary_command[1].endswith('/summarizeAnalysis.py'))
+        self.assertEqual(summary_command[2:], [str(self.base / 'merged'), '-o',
+                                             str(self.base / 'merged_summary'), '--no-plots'])
+        self.assertTrue((self.base / 'merged_inputs/0/analysis_evt0_3/events.root').is_file())
+        self.assertEqual(saved.data['merge']['summary'], str(self.base / 'merged_summary'))
+
+    def test_tree_merge_can_defer_summary(self):
+        saved = self.tree_merge(summarize=False)
+        with patch.object(workflow.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+            workflow.merge(saved, execute=True)
+        self.assertEqual(run.call_count, 1)
+        self.assertNotIn('summary', saved.data['merge'])
+
+    def test_tree_merge_rejects_omission_before_extracting(self):
+        saved = self.tree_merge(skip_event_records=True)
+        with patch.object(workflow.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'Cannot omit event records'):
+                workflow.merge(saved, execute=True)
+        run.assert_not_called()
+        self.assertFalse((self.base / 'merged_inputs').exists())
+        args = SimpleNamespace(skip_event_records=True)
+        results = [record['analysis'] for record in planning.upstream(saved.settings)['records']]
+        with self.assertRaisesRegex(ValueError, 'Cannot omit event records'):
+            checking.checkAnalysis.merge_analysis(results, args)
+
+    def test_summary_failure_keeps_successful_merge_record(self):
+        saved = self.tree_merge()
+        with patch.object(workflow.subprocess, 'run', side_effect=[None, subprocess.CalledProcessError(1, 'summary')]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                workflow.merge(saved, execute=True)
+        merged = json.loads(saved.path.read_text())['merge']
+        self.assertEqual(merged['output'], str(self.base / 'merged'))
+        self.assertNotIn('summary', merged)
+
+    def test_old_analysis_version_rejected_before_merging(self):
+        saved = self.tree_merge()
+        upstream = Path(saved.settings['campaign_dir']) / 'analysis/checked.json'
+        data = json.loads(upstream.read_text())
+        data['records'][0]['analysis']['manifest'].update(output_version=6, tree_only=False)
+        state.write_json(upstream, data)
+        with self.assertRaisesRegex(ValueError, 'requires version-7'):
+            workflow.merge(saved, execute=True)
+
+    def test_new_merge_defaults_preserve_upstream_saved_settings(self):
+        for step in ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter', 'replayfilter'):
+            with self.subTest(step=step):
+                settings = self.settings(step)
+                saved = state.State(settings)
+                original = config.signature(settings)
+                original.pop('summarize', None)
+                original['skip_event_records'] = True
+                saved.data['configuration'] = original
+                saved.save()
+                self.assertEqual(state.State(settings).data['id'], saved.data['id'])
 
     def test_preview_then_append_new_upstream_batch_preserves_groups(self):
         first = self.record(identity='first')

@@ -38,7 +38,7 @@ OPTIONS = {
                       '--strawDesign': 10, '--noSND': True, '--debug': 0, '--seed': 0},
 }
 OPTIONS['disreplay_filter'] = OPTIONS['disreplay_gen']
-ANALYSIS = dict(save_plots=False, weight_factor=3.6e-6, target_sum_weights=None,
+ANALYSIS = dict(save_plots=False, tree_only=True, weight_factor=3.6e-6, target_sum_weights=None,
                 failed_job_factor=1.0, geometry_file=None,
                 plot_axes=dict(x=[-500, 500, 500], y=[-500, 500, 500], z=[2000, 10000, 800]))
 
@@ -58,7 +58,7 @@ def path_value(value, base):
 def load(path, test=False):
     path = Path(path).expanduser().resolve()
     supplied = mapping(path)
-    unknown = supplied.keys() - (COMMON.keys() | DEFAULTS.keys() | {'workflow', 'step'})
+    unknown = supplied.keys() - (COMMON.keys() | DEFAULTS.keys() | {'workflow', 'step', 'summarize'})
     if unknown:
         raise ValueError(f'Unknown settings in {path.name}: {sorted(unknown)}')
     common_path = path.parent / supplied.get('workflow', 'workflow.yaml')
@@ -70,11 +70,15 @@ def load(path, test=False):
     if step not in STEPS:
         raise ValueError(f'step must be one of {", ".join(STEPS)}')
     only = {'input_pattern': ('disgen',), 'geometry_file': ('replayfilter',),
-            'skip_event_records': ('merger',), 'save_plots': ('merger',),
+            'skip_event_records': ('merger',), 'save_plots': ('merger',), 'summarize': ('merger',),
             'merge_output': ('merger',), 'unpack_dir': ('merger',)}
     for key, steps in only.items():
         if key in supplied and step not in steps:
             raise ValueError(f'{key} applies only to {", ".join(steps)}')
+    if step == 'merger':
+        # Keep unrelated upstream stages compatible with their saved settings.
+        settings['skip_event_records'] = supplied.get('skip_event_records', False)
+        settings['summarize'] = supplied.get('summarize', True)
     if step == 'merger' and any(key in supplied for key in ('first_event', 'events_per_file', 'events_per_subjob', 'n_subjobs')):
         raise ValueError('merger consumes checked archives; it does not split event ranges')
     settings['name'] = settings['name'] or step
@@ -102,8 +106,8 @@ def load(path, test=False):
             raise ValueError(f'{key} must be null or a positive integer')
     if settings['n_subjobs'] is not None and settings['events_per_subjob'] is not None:
         raise ValueError('Choose n_subjobs or events_per_subjob')
-    for key in ('require_complete', 'skip_event_records', 'save_plots'):
-        if type(settings[key]) is not bool:
+    for key in ('require_complete', 'skip_event_records', 'save_plots', 'summarize'):
+        if key in settings and type(settings[key]) is not bool:
             raise ValueError(f'{key} must be true or false')
     for key in ('state_dir', 'output_base', 'fs_install', 'workspace'):
         base = path.parent if key in supplied else common_path.parent
@@ -124,6 +128,9 @@ def load(path, test=False):
         if settings['analysis'].keys() - ANALYSIS.keys():
             raise ValueError('Unknown analysis setting; type, input, range and output are managed by the workflow')
         settings['analysis'] = {**deepcopy(ANALYSIS), **settings['analysis']}
+        for key in ('tree_only', 'save_plots'):
+            if type(settings['analysis'][key]) is not bool:
+                raise ValueError(f'analysis.{key} must be true or false')
         if settings['analysis']['geometry_file']:
             settings['analysis']['geometry_file'] = path_value(settings['analysis']['geometry_file'], path.parent)
     elif settings['analysis']:

@@ -57,14 +57,32 @@ def merge(state, execute=False):
     checked = upstream(settings)
     results = [record['analysis'] for record in checked['records']]
     checkAnalysis.validate_analysis_sources(results)
+    if any(result['manifest']['output_version'] != 7 for result in results):
+        raise ValueError('Current FairShip merging requires version-7 outputs; rerun analysis in a new step/campaign')
+    tree_only = results[0]['manifest'].get('tree_only', False)
+    if tree_only and settings['skip_event_records']:
+        raise ValueError('Cannot omit event records from a tree-only merge; set skip_event_records: false')
     destination = Path(settings['merge_output'] or str(Path(settings['output_dir']) / 'merged'))
     if settings['test'] and settings['merge_output']:
         destination = destination.with_name(destination.name + '_test')
     unpack = Path(settings['unpack_dir']) if settings['unpack_dir'] else None
     if settings['test'] and unpack:
         unpack = unpack.with_name(unpack.name + '_test')
+    summary = destination.with_name(destination.name + '_summary') if tree_only and settings['summarize'] else None
+    summarizer = Path(settings['fs_install']) / 'newMuonDIS/summarizeAnalysis.py'
+    if summary:
+        if not summarizer.is_file():
+            raise ValueError(f'Summarizer not found: {summarizer}')
+        if summary.exists() and (not summary.is_dir() or any(summary.iterdir())):
+            raise ValueError(f'Summary output must be new or empty: {summary}')
+        input_dir = (unpack or destination.with_name(destination.name + '_inputs')).resolve()
+        summary_dir = summary.resolve()
+        if summary_dir == input_dir or summary_dir in input_dir.parents or input_dir in summary_dir.parents:
+            raise ValueError('Summary output and unpack directory must be separate')
     print(f'Merge {len(results)} checked archives into {destination}')
     print(f'skip_event_records: {settings["skip_event_records"]}; save_plots: {settings["save_plots"]}')
+    if summary:
+        print(f'Summarize merged event tree into {summary}')
     if not execute:
         print('Preview only; add --submit to merge locally in FairShip.')
         return 0
@@ -76,6 +94,13 @@ def merge(state, execute=False):
     state.data['merge'] = dict(output=str(destination), upstream_state=checked['state_id'],
                               upstream_revision=checked['revision'], inputs=[r['archive'] for r in results])
     state.save()
+    if summary:
+        command = [sys.executable, str(summarizer), str(destination), '-o', str(summary)]
+        if not settings['save_plots']:
+            command.append('--no-plots')
+        subprocess.run(command, check=True)
+        state.data['merge']['summary'] = str(summary)
+        state.save()
     return 0
 
 

@@ -1,7 +1,7 @@
 # Replay checker-approved disgen files; use saved ROOT entry counts for splitting.
 step: disreplay_gen
 # upstream: disgen
-events_per_subjob: 1000        # Example size; default null (one range).
+events_per_subjob: 500        # Example size; default null (one range).
 options:
   --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
   --shieldName: null           # Suppress workflow default TRY_2026 when using --geofile.
