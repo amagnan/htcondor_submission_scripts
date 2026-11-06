@@ -11,12 +11,42 @@ from prodWorkflow.state import verify, write_json
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def monitor(jobs):
+    """Poll recorded Condor jobs synchronously before copying their statuses."""
+    from GangaCore.GPIDev.Base.Proxy import stripProxy
+
+    masters = [stripProxy(job) for job in jobs]
+    active = {}
+    for master in masters:
+        for job in master.subjobs if master.subjobs else [master]:
+            job = stripProxy(job)
+            if job.status in ('submitted', 'running'):
+                active.setdefault(type(job.backend), []).append(job)
+    print(f'Refreshing {sum(map(len, active.values()))} active Ganga ranges from the backend...', flush=True)
+    # Batch Ganga sessions do not enable monitoring by default. runMonitoring()
+    # is asynchronous in current Ganga, so it cannot guarantee a fresh snapshot.
+    for backend, ranges in active.items():
+        try:
+            backend.updateMonitoringInformation(ranges)
+        except Exception as error:
+            raise ValueError(f'Backend status refresh failed: {error}; rerun status/check') from error
+    for master in masters:
+        if master.subjobs:
+            master.updateMasterJobStatus()
+
+
 def preview(state, groups, verbose=False):
     settings = state.settings
     print(f'{settings["name"]}: {len(groups)} Ganga masters, '
           f'{sum(len(group["units"]) for group in groups)} executable ranges '
           f'({"test" if settings["test"] else "production"})')
     print(f'State: {state.path}')
+    if not groups:
+        print('No new eligible work selected; existing attempts are not submitted again.')
+        if settings['test'] and state.data['attempts']:
+            print('Test mode stays on the first input. Its recorded Ganga job IDs: ' +
+                  ', '.join(str(attempt['job_id']) for attempt in state.data['attempts']))
+        print('Use status/check to inspect existing jobs, then retry for checker-rejected terminal ranges.')
     for group in groups:
         print(f'  {group["id"]}: {len(group["inputs"]["sources"])} inputs, {len(group["units"])} ranges')
         if verbose:
@@ -33,6 +63,8 @@ def preview(state, groups, verbose=False):
 
 
 def submit(state, groups, api):
+    if not groups:
+        return
     settings = state.settings
     section = api.config['Configuration']
     actual_workspace = Path(os.path.expandvars(section['gangadir'])).expanduser() / 'workspace' / section['user'] / section['repositorytype']

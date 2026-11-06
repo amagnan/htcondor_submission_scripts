@@ -3,7 +3,7 @@ step: disreplay_gen
 # upstream: disgen
 events_per_subjob: 500        # Example size; default null (one range).
 options:
-  --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
+  --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS/geo_00225854-9b0d-4e5d-bff9-11ca5f530b31.root
   --shieldName: null           # Suppress workflow default TRY_2026 when using --geofile.
   --strawDesign: null          # Suppress workflow default 10 when using --geofile.
   --noSND: false               # Suppress workflow default true when using --geofile.
@@ -18,7 +18,7 @@ options:
 # events_per_file: -1          # All entries reported by the upstream checker.
 # n_subjobs: null              # Alternative to events_per_subjob.
 # Less commonly changed workflow settings (defaults shown).
-# workflow: workflow.yaml       # Relative to this file.
+workflow: workflow.yaml       # Relative to this file.
 # name: STEP                   # Default: the step value; use a new name for a new selection.
 # require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
 # n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.

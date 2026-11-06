@@ -140,11 +140,23 @@ class WorkflowTests(unittest.TestCase):
 
     def test_all_shipped_configs_load_and_have_isolated_modes(self):
         for path in (ROOT / 'prodWorkflow').glob('*.yaml'):
-            if path.name == 'workflow.yaml':
+            if path.name == 'workflow.yaml' or path.name.startswith('workflow_'):
                 continue
             normal, test = config.load(path), config.load(path, True)
             self.assertNotEqual(normal['step_dir'], test['step_dir'])
             self.assertNotEqual(normal['output_dir'], test['output_dir'])
+
+    def test_parallel_campaign_stages_share_their_own_namespace(self):
+        folder = ROOT / 'prodWorkflow'
+        for test in (False, True):
+            original = config.load(folder / 'disgen.yaml', test)
+            parallel = config.load(folder / 'disgen_26.yaml', test)
+            self.assertNotEqual(original['campaign_dir'], parallel['campaign_dir'])
+            for step in config.STEPS:
+                settings = config.load(folder / f'{step}_26.yaml', test)
+                self.assertEqual(settings['campaign_dir'], parallel['campaign_dir'])
+                self.assertEqual(Path(settings['output_dir']).parent,
+                                 Path(parallel['output_dir']).parent)
 
     def test_unknown_settings_and_reserved_options_rejected(self):
         with self.assertRaisesRegex(ValueError, 'Unknown settings'):
@@ -171,6 +183,80 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual([unit['spec']['count'] for unit in groups[0]['units']], [3, 3, 1])
         self.assertEqual(groups[0]['inputs']['sources'], source['sources'])
+
+    def test_one_input_creates_only_25_ranges_and_does_not_fingerprint_the_rest(self):
+        (self.inputs / 'sim_b.root').touch()
+        settings = self.settings(n_jobs=1, events_per_file=250000, events_per_subjob=10000)
+        with patch.object(planning, 'fingerprint', wraps=state.fingerprint) as fingerprint:
+            groups = planning.plan(settings)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]['units']), 25)
+        self.assertEqual([(unit['spec']['first'], unit['spec']['count']) for unit in groups[0]['units']],
+                         [(first, 10000) for first in range(0, 250000, 10000)])
+        fingerprint.assert_called_once_with(str(self.inputs / 'sim_a.root'))
+
+    def test_limited_cli_submissions_record_only_each_requested_batch(self):
+        (self.inputs / 'sim_b.root').write_bytes(b'next input')
+        settings = self.settings(n_jobs=1, events_per_file=250000, events_per_subjob=10000)
+        self.current_state = state.State(settings)
+        api = self.api()
+        args = ['plan', settings['config_file'], '--submit']
+        with contextlib.redirect_stdout(io.StringIO()):
+            workflow.main(args, api)
+        saved = state.State(settings)
+        self.assertEqual(len(saved.data['groups']), 1)
+        self.assertEqual(len(saved.data['attempts']), 1)
+        self.assertEqual(len(list(saved.path.parent.glob('tasks/*/*.json'))), 25)
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(planning, 'fingerprint', wraps=state.fingerprint) as fingerprint:
+            workflow.main(args, api)
+        fingerprint.assert_called_once_with(str(self.inputs / 'sim_b.root'))
+        saved = state.State(settings)
+        self.assertEqual(len(saved.data['groups']), 2)
+        self.assertEqual(len(saved.data['attempts']), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            workflow.main(args, api)
+        self.assertEqual(len(state.State(settings).data['attempts']), 2)
+
+    def test_limited_downstream_plan_does_not_verify_unselected_inputs(self):
+        first, second = self.record(), self.record(name='other.root', identity='other')
+        self.exported('disgen', [first, second])
+        Path(second['sources'][0]).unlink()
+        with patch.object(planning, 'verify', wraps=state.verify) as verify:
+            groups = planning.plan(self.settings('disreplay_gen', n_jobs=1))
+        self.assertEqual([group['inputs']['id'] for group in groups], [first['id']])
+        verify.assert_called_once_with(first['files'])
+
+    def test_test_mode_stays_on_first_input_without_fingerprinting_the_rest(self):
+        (self.inputs / 'sim_b.root').touch()
+        settings = self.settings(test=True)
+        saved, _ = self.submitted(settings)
+        self.assertEqual(planning.plan(settings, saved), [])
+
+    def test_check_prunes_legacy_groups_without_attempts_but_keeps_partial_masters(self):
+        (self.inputs / 'sim_b.root').write_bytes(b'unrequested input')
+        settings = self.settings(n_jobs=1)
+        saved = state.State(settings)
+        saved.add_groups(planning.plan(dict(settings, n_jobs=-1)))
+        self.current_state = saved
+        with contextlib.redirect_stdout(io.StringIO()):
+            submission.submit(saved, planning.select(saved), self.api())
+        # Keep missing ranges within a master that has at least one attempt.
+        first_unit = saved.data['groups'][0]['units'][0]['id']
+        saved.data['attempts'][0]['units'] = {first_unit: 0}
+        saved.save()
+        previous_revision = saved.data['revision']
+        state.write_json(saved.path.with_name('checked.json'),
+                         dict(state_id=saved.data['id'], revision=previous_revision, successful=[], problems=[]))
+        with patch.object(checking, 'inspect', side_effect=ValueError('expected failure')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workflow.main(['check', settings['config_file']]), 1)
+        compact = state.State(settings)
+        self.assertEqual(len(compact.data['groups']), 1)
+        self.assertEqual(compact.data['groups'][0], saved.data['groups'][0])
+        self.assertEqual(compact.data['attempts'], saved.data['attempts'])
+        self.assertGreater(compact.data['revision'], previous_revision)
+        self.assertEqual(len(compact.checked()['problems']), 3)
+        self.assertNotIn(saved.data['groups'][1]['units'][0]['id'], output.getvalue())
 
     def test_incomplete_and_stale_exports_block_by_default(self):
         upstream = self.exported('disgen', [self.record()], complete=False)
@@ -327,10 +413,98 @@ class WorkflowTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             workflow.main([settings['config_file'], '--submit'])
 
-    def test_root_launcher_help_does_not_start_ganga(self):
-        result = subprocess.run(['bash', str(ROOT / 'gangaSubmit.sh'), 'retry', '--help'], text=True, capture_output=True)
+    def test_workflow_launcher_help_does_not_start_ganga(self):
+        result = subprocess.run(['bash', str(ROOT / 'prodWorkflow/gangaSubmit.sh'), 'retry', '--help'],
+                                text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('checker-rejected terminal ranges', result.stdout)
+
+    def test_status_polls_before_snapshot_and_allows_unfinished_jobs(self):
+        settings = self.settings()
+        saved, api = self.submitted(settings)
+        job = api.registry[100]
+        job.subjobs = [SimpleNamespace(id=i, status='submitted') for i in range(3)]
+        def monitor(jobs):
+            self.assertEqual(jobs, [job])
+            job.subjobs[0].status = 'completed'
+            job.subjobs[1].status = 'failed'
+            job.subjobs[2].status = 'running'
+        api.monitor = Mock(side_effect=monitor)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workflow.main(['status', settings['config_file']], api), 0)
+        api.monitor.assert_called_once_with([job])
+        refreshed = state.State(settings)
+        self.assertEqual(list(refreshed.data['attempts'][0]['statuses'].values()),
+                         ['completed', 'failed', 'running'])
+        self.assertIn("'completed': 1", output.getvalue())
+
+    def test_check_polls_and_saves_before_fairship_handoff(self):
+        settings = self.settings(test=True)
+        saved, api = self.submitted(settings)
+        job = api.registry[100]
+        api.monitor = Mock(side_effect=lambda jobs: setattr(job, 'status', 'completed'))
+        def fairship(settings, argv):
+            refreshed = state.State(settings)
+            self.assertEqual(list(refreshed.data['attempts'][0]['statuses'].values()), ['completed'])
+            return 0
+        with patch.object(workflow, 'fairship', side_effect=fairship):
+            self.assertEqual(workflow.main(['check', settings['config_file'], '--test'], api), 0)
+        api.monitor.assert_called_once_with([job])
+
+    def test_refresh_does_not_monitor_foreign_or_missing_jobs(self):
+        saved, api = self.submitted(self.settings())
+        monitor = Mock()
+        api.registry[100].comment = 'another workflow'
+        saved.refresh(api.jobs, monitor)
+        monitor.assert_not_called()
+        self.assertIn('identity differs', saved.data['attempts'][0]['error'])
+        api.registry.clear()
+        saved.refresh(api.jobs, monitor)
+        monitor.assert_not_called()
+        self.assertEqual(set(saved.data['attempts'][0]['statuses'].values()), {'unknown'})
+
+    def test_backend_monitor_waits_for_split_and_unsplit_jobs(self):
+        class Backend:
+            @staticmethod
+            def updateMonitoringInformation(jobs):
+                for job in jobs:
+                    job.status = 'completed'
+        children = [SimpleNamespace(status=status, backend=Backend())
+                    for status in ('running', 'submitted', 'failed')]
+        master = SimpleNamespace(subjobs=children, updateMasterJobStatus=Mock())
+        single = SimpleNamespace(subjobs=[], status='submitted', backend=Backend())
+        proxy = SimpleNamespace(stripProxy=lambda job: job)
+        with patch.dict(sys.modules, {'GangaCore.GPIDev.Base.Proxy': proxy}), \
+                patch.object(Backend, 'updateMonitoringInformation', wraps=Backend.updateMonitoringInformation) as poll, \
+                contextlib.redirect_stdout(io.StringIO()):
+            submission.monitor([master, single])
+        poll.assert_called_once_with([children[0], children[1], single])
+        self.assertEqual([job.status for job in children], ['completed', 'completed', 'failed'])
+        self.assertEqual(single.status, 'completed')
+        master.updateMasterJobStatus.assert_called_once_with()
+
+    def test_monitor_failure_stops_check_before_fairship(self):
+        settings = self.settings(test=True)
+        saved, api = self.submitted(settings)
+        api.monitor = Mock(side_effect=ValueError('Backend status refresh failed'))
+        before = saved.path.read_text()
+        with patch.object(workflow, 'fairship') as fairship, \
+                self.assertRaisesRegex(ValueError, 'Backend status refresh failed'):
+            workflow.main(['check', settings['config_file'], '--test'], api)
+        fairship.assert_not_called()
+        self.assertEqual(saved.path.read_text(), before)
+
+    def test_repeated_test_submission_explains_existing_job_without_side_effects(self):
+        settings = self.settings(test=True)
+        saved, api = self.submitted(settings)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(workflow.main([settings['config_file'], '--test', '--submit'], api), 0)
+        self.assertIn('No new eligible work', output.getvalue())
+        self.assertIn('recorded Ganga job IDs: 100', output.getvalue())
+        self.assertEqual(len(api.registry), 1)
+        self.assertEqual(len(state.State(settings).data['attempts']), 1)
+        # An empty submission must not even touch Ganga storage configuration.
+        submission.submit(saved, [], SimpleNamespace())
 
     def test_missing_stdout_reports_condor_disk_failure(self):
         saved, _ = self.submitted(self.settings())

@@ -1,6 +1,7 @@
 """Plan from checked exports, never by scanning a downstream production tree."""
 
 import hashlib
+from itertools import islice
 import json
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from prodWorkflow.config import EXECUTABLES, PARENTS
 from prodWorkflow.state import digest, fingerprint, verify
 
 
-def upstream(settings):
+def upstream(settings, verify_files=True):
     folder = Path(settings['campaign_dir']) / settings['upstream']
     try:
         checked = json.loads((folder / 'checked.json').read_text())
@@ -25,8 +26,9 @@ def upstream(settings):
         raise ValueError(f'{settings["upstream"]} is incomplete; check/retry it, or set require_complete: false explicitly')
     if not checked['records']:
         raise ValueError(f'No checker-approved inputs in {folder / "checked.json"}')
-    for record in checked['records']:
-        verify(record['files'])
+    if verify_files:
+        for record in checked['records']:
+            verify(record['files'])
     return checked
 
 
@@ -54,28 +56,40 @@ def ranges(settings, entries):
     return result
 
 
-def plan(settings):
+def plan(settings, state=None):
     step = settings['step']
+    limit = 1 if settings['test'] else settings['n_jobs']
+    known = {group['id'] for group in state.data['groups']} if state is not None else set()
+    if state is not None and limit != -1:
+        limit -= len(select(state))
+    if limit == 0:
+        return []
     if step == 'disgen':
         directory = Path(settings['input_dir'])
         if not directory.is_dir():
             raise ValueError(f'Not an input directory: {directory}')
-        inputs = [dict(id=digest(str(path.resolve())), sources=[str(path.resolve())],
-                       entries=settings['first_event'] + settings['events_per_file'], files=[fingerprint(path)])
+        inputs = (dict(id=digest(str(path.resolve())), sources=[str(path.resolve())],
+                       entries=settings['first_event'] + settings['events_per_file'])
                   for path in sorted(directory.rglob(settings['input_pattern']))
-                  if path.is_file() and not path.name.endswith('_rec.root') and '_backup' not in path.stem]
-        if not inputs:
-            raise ValueError(f'No inputs matching {settings["input_pattern"]} in {directory}')
+                  if not path.name.endswith('_rec.root') and '_backup' not in path.stem and path.is_file())
     else:
-        inputs = upstream(settings)['records']
+        inputs = upstream(settings, verify_files=False)['records']
     if settings['test']:
-        inputs = inputs[:1]
+        inputs = islice(inputs, 1)
     groups = []
+    found = False
     for record in inputs:
+        found = True
+        group_id = digest([settings['name'], record['id']])
+        if group_id in known:
+            continue
         if step.startswith('disreplay') and record['entries'] == 0:
             print(f'Skipping empty checked input {record["id"]}')
             continue
-        group_id = digest([settings['name'], record['id']])
+        if step == 'disgen':
+            record['files'] = [fingerprint(record['sources'][0])]
+        else:
+            verify(record['files'])
         group = dict(id=group_id, parent=record['id'], inputs=record, units=[])
         if step == 'replayfilter':
             if settings['first_event'] != 0 or settings['events_per_file'] != -1 or settings['n_subjobs'] or settings['events_per_subjob']:
@@ -121,6 +135,10 @@ def plan(settings):
                     spec['args'] = ['-f', source, *options, '-s', str(first), '-n', str(count), '-o', spec['output']]
             group['units'].append(dict(id=unit_id, spec=spec))
         groups.append(group)
+        if limit != -1 and len(groups) >= limit:
+            break
+    if step == 'disgen' and not found:
+        raise ValueError(f'No inputs matching {settings["input_pattern"]} in {directory}')
     return groups
 
 

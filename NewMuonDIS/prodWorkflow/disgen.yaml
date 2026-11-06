@@ -1,17 +1,20 @@
 # First stage: the ONLY stage that discovers input files.
 step: disgen
-input_dir: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5
+input_dir: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS/
+#/eos/experiment/ship/simulation/cuda_muons/try_2026_MS5
 events_per_file: 250000        # Required for disgen; maximum input entries per file.
 events_per_subjob: 25000      # Example: ten subjobs per full file; default null.
+n_jobs: 100                   # Maximum new Ganga masters per invocation; -1 = all.
 options:
-  --geoFile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
+  --geoFile: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS/geo_00225854-9b0d-4e5d-bff9-11ca5f530b31.root
+#/eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
   --nDIS: 100                 # Workflow default 100 (executable default 1000).
   --z_min: 2000               # Workflow default 2000 cm (executable default 2500).
   --z_max: 9500               # Workflow default 9500 cm (executable default 20000).
   # --seed: null              # Omitted by default: time-based seed.
   # --debug: 0
   # --pythia-stdout: false    # true sends Pythia messages to stdout instead of fort.11.
-  # --check-all-volumes: false
+  # --check-all-volumes: true
   # --muon-shield-field-map: null  # Geometry shieldName determines the map.
   # --muon-shield-field-z: null    # Geometry entrance determines the offset.
   # --poca-jump-threshold: 1.0     # cm.
@@ -20,10 +23,9 @@ options:
 # first_event: 0
 # n_subjobs: null              # Alternative to events_per_subjob.
 # Less commonly changed workflow settings (defaults shown).
-# workflow: workflow.yaml       # Relative to this file.
+workflow: workflow.yaml       # Relative to this file.
 # name: STEP                   # Default: the step value; use a new name for a new selection.
 # require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
-# n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
 # Resource overrides inherit workflow.yaml; its defaults are:
 # max_runtime: 86000            # Seconds.
 # memory_mb: 3000

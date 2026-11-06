@@ -1,8 +1,9 @@
 # MuonDIS production workflow
 
 Configure a campaign once in `workflow.yaml`, then submit/check one stage at a
-time. The root `../gangaSubmit.sh` and this directory's `gangaSubmit.sh` both use
-this workflow. There is no legacy CLI/configuration translation.
+time. Use this directory's `gangaSubmit.sh` for this workflow; the root
+`../gangaSubmit.sh` is the legacy launcher. There is no legacy CLI/configuration
+translation.
 
 ```mermaid
 flowchart TD
@@ -63,22 +64,38 @@ The merger and its subsequent summary run locally in the FairShip Pixi environme
 not as Ganga jobs.
 Checks also run there automatically when called through `gangaSubmit.sh`.
 
-The same commands work from the repository root with `prodWorkflow/` prepended
-to the YAML filename. Offline planning/help needs Python + PyYAML only:
+From the repository root, prepend `prodWorkflow/` to both the launcher and the
+YAML filename. Offline planning/help needs Python + PyYAML only:
 
 ```bash
 python3 prodWorkflow/workflow.py plan prodWorkflow/disgen.yaml --test --verbose
-./gangaSubmit.sh --help
-./gangaSubmit.sh plan --help
-./gangaSubmit.sh check --help
-./gangaSubmit.sh retry --help
-./gangaSubmit.sh merge --help
+./prodWorkflow/gangaSubmit.sh --help
+./prodWorkflow/gangaSubmit.sh plan --help
+./prodWorkflow/gangaSubmit.sh check --help
+./prodWorkflow/gangaSubmit.sh retry --help
+./prodWorkflow/gangaSubmit.sh merge --help
 ```
 
 `python3 workflow.py status FILE.yaml` displays saved statuses; the Ganga
-launcher refreshes them from the live repository. Direct Python checks/merges
+launcher polls the backend for the recorded jobs before saving their statuses.
+Ganga batch scripts normally disable automatic monitoring; reading the repository
+alone can therefore leave finished jobs marked `submitted`. `status` succeeds
+even while some jobs are unfinished; `check` exports valid completed ranges and
+returns nonzero until every recorded range passes. Direct Python checks/merges
 must be run in FairShip's environment. No CLI options override YAML physics,
 resources or splitting. The CLI contains action flags only.
+
+For a parallel campaign, use a distinct `tag` or `production` in a separate
+shared YAML and set `workflow: workflow_26.yaml` in **every** corresponding stage
+YAML. The filename suffix alone does not select the shared configuration.
+The supplied `_26.yaml` stages use `workflow_26.yaml` throughout.
+
+Repeated `--test --submit` commands keep the first input and do not duplicate an
+existing attempt. When no work is selected, the preview lists the recorded test
+job IDs. Inspect it with `status disgen_26.yaml --test`, then run
+`check disgen_26.yaml --test --metadata`; use `retry disgen_26.yaml --test --submit`
+only for checker-rejected terminal ranges. A fresh independent test requires a
+new campaign or step `name`.
 
 ## Checks and next-step inputs
 
@@ -118,10 +135,15 @@ way. Newly checked upstream outputs are appended when planning subsequent
 batches; previously submitted groups are never silently regrouped. If a saved
 group's inputs change, use a new campaign/step name rather than mixing them.
 
-If `n_jobs` limits a submission batch, the complete plan is still recorded.
-Repeat the ordinary submission command for the remaining unsubmitted masters.
-The checker reports unsubmitted ranges too, so incomplete campaigns do not look
-complete simply because the current batch finished.
+`n_jobs` limits how many new masters are planned and recorded per submission.
+For example, `n_jobs: 1`, `events_per_file: 250000` and
+`events_per_subjob: 10000` select one input and create 25 subjobs. Only selected
+inputs are fingerprinted and expanded into tasks; disgen still lists matching
+paths to select inputs in a stable sorted order. Repeat the ordinary submission
+command to select the next inputs, skipping groups already recorded.
+The checker covers recorded submission batches, not the entire input directory.
+Old pre-assigned groups with no submission attempt are removed automatically;
+every group with an attempt retains all its ranges, including unfinished ones.
 
 ## Failed ranges
 

@@ -16,7 +16,7 @@ sys.path.insert(0, str(HERE.parent))
 from prodWorkflow.config import load
 from prodWorkflow.planning import plan, select, upstream
 from prodWorkflow.state import State, state_lock
-from prodWorkflow.submission import preview, submit
+from prodWorkflow.submission import monitor, preview, submit
 
 
 def parser():
@@ -121,14 +121,18 @@ def main(argv=None, api=None):
     if api is not None and args.action in ('check', 'merge'):
         with state_lock(Path(settings['step_dir']) / 'state.json'):
             state = State(settings)
-            state.refresh(api.jobs)
+            if state.prune_unsubmitted_groups():
+                state.save()
+            state.refresh(api.jobs, getattr(api, 'monitor', None))
             if state.data['attempts']:
                 state.save()
         return fairship(settings, argv)
     with state_lock(Path(settings['step_dir']) / 'state.json'):
         state = State(settings)
+        if state.prune_unsubmitted_groups():
+            state.save()
         if api is not None:
-            state.refresh(api.jobs)
+            state.refresh(api.jobs, getattr(api, 'monitor', None))
         if args.action == 'status':
             if api is not None and state.data['attempts']:
                 state.save()
@@ -158,7 +162,7 @@ def main(argv=None, api=None):
             if state.checked() is None:
                 raise ValueError('Run check before retry; its report identifies rejected ranges')
         else:
-            state.add_groups(plan(settings))
+            state.add_groups(plan(settings, state))
         selected = select(state, retry=args.action == 'retry')
         preview(state, selected, args.verbose)
         if args.submit:
@@ -173,6 +177,8 @@ if __name__ == '__main__' or IN_GANGA:
     api = SimpleNamespace(**{name: globals()[name] for name in
                             ('Job', 'Executable', 'File', 'ArgSplitter', 'MassStorageFile', 'Condor',
                              'FileChecker', 'config', 'jobs')}) if IN_GANGA else None
+    if api is not None:
+        api.monitor = monitor
     try:
         code = main(api=api)
     except (OSError, ValueError, KeyError) as error:

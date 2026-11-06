@@ -79,16 +79,40 @@ class State:
     def attempts(self, unit):
         return [attempt for attempt in self.data['attempts'] if unit in attempt['units']]
 
+    def prune_unsubmitted_groups(self):
+        """Drop legacy pre-assignments, retaining every group with an attempt."""
+        attempted = {unit for attempt in self.data['attempts'] for unit in attempt['units']}
+        groups = [group for group in self.data['groups']
+                  if any(unit['id'] in attempted for unit in group['units'])]
+        removed = len(self.data['groups']) - len(groups)
+        if removed:
+            self.data['groups'] = groups
+            self.data['revision'] += 1
+        return removed
+
     def marker(self, attempt):
         return f'[prodWorkflow:{self.data["id"]}:{attempt["id"]}]'
 
-    def refresh(self, registry):
+    def refresh(self, registry, monitor=None):
+        jobs = {}
         for attempt in self.data['attempts']:
-            attempt['refreshed'] = timestamp()
             try:
                 job = registry(attempt['job_id'])
                 if self.marker(attempt) not in job.comment:
                     raise ValueError('Ganga job identity differs from the saved workflow')
+                jobs[attempt['id']] = job
+            except Exception as error:
+                attempt['refreshed'] = timestamp()
+                attempt['statuses'] = dict.fromkeys(attempt['units'], 'unknown')
+                attempt['error'] = str(error)
+        if monitor is not None and jobs:
+            monitor(list(jobs.values()))
+        for attempt in self.data['attempts']:
+            if attempt['id'] not in jobs:
+                continue
+            attempt['refreshed'] = timestamp()
+            try:
+                job = jobs[attempt['id']]
                 children = {child.id: child for child in job.subjobs}
                 for unit, child in attempt['units'].items():
                     target = job if child is None else children.get(child)
