@@ -1,5 +1,7 @@
 # Edit this shared campaign identity and installation before submitting.
 # Every stage reads this file. Relative paths resolve beside this file.
+# Cross sections: replayfilter_26.yaml computes analytical muDIS_xsec;
+# analysis_26.yaml consumes it with analysis.cross_section: stored and weight_factor: 1.
 production: 261105
 tag: TRY2026_2026
 output_base: /eos/experiment/ship/user/ammagnan/MuonDIS

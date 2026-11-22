@@ -10,7 +10,7 @@ options:
   --nDIS: 100                 # Workflow default 100 (executable default 1000).
   --z_min: 2000               # Workflow default 2000 cm (executable default 2500).
   --z_max: 9500               # Workflow default 9500 cm (executable default 20000).
-  # --seed: null              # Omitted by default: time-based seed.
+  # --seed: 12345             # Omit for automatic production/job seed; null opts into time-based seeding.
   # --debug: 0
   # --pythia-stdout: false    # true sends Pythia messages to stdout instead of fort.11.
   # --check-all-volumes: true

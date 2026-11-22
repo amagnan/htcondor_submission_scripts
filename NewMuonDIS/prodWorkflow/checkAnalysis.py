@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Check Ganga analyseEvents directory archives and optionally merge the results.
+
+Example: python3 checkAnalysis.py ~/gangadir/workspace/ammagnan/LocalXML \
+    --first-job 4000 --num-jobs 10 --merge-output /path/to/merged
+
+Checks successful worker logs, transfers, archive structure and run.json without
+opening ROOT files. --check-root validates the current events.root schema and
+scalar path lengths. --merge-output unpacks outputs and runs mergeAnalysis.py.
+Unpacked inputs are retained for provenance. Failed jobs block merging unless
+--merge-successful explicitly requests a partial result.
+"""
+
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+if __package__:
+    from .checkPrepareEventsOutputs import (eos_path, print_stats, require_preparation_metadata,
+                                           subjob_logs)
+    from .replayDiagnostics import path_statistics, print_path_statistics
+else:
+    from checkPrepareEventsOutputs import (eos_path, print_stats, require_preparation_metadata,
+                                           subjob_logs)
+    from replayDiagnostics import path_statistics, print_path_statistics
+
+
+def read_analysis_archive(filename):
+    """Validate transfer structure and completion metadata without loading ROOT."""
+    path = Path(eos_path(filename) or filename).expanduser()
+    with tarfile.open(path, 'r:gz') as archive:
+        members = archive.getmembers()
+        names = set()
+        roots = set()
+        for member in members:
+            parts = Path(member.name).parts
+            if (not parts or Path(member.name).is_absolute() or '..' in parts
+                    or not (member.isfile() or member.isdir()) or member.name in names):
+                raise ValueError(f'Unsafe or duplicate archive member: {member.name}')
+            names.add(member.name)
+            roots.add(parts[0])
+        if len(roots) != 1:
+            raise ValueError('Analysis archive must contain exactly one directory')
+        root = roots.pop()
+        manifest_member = archive.getmember(root + '/run.json')
+        if not manifest_member.isfile() or manifest_member.size > 16 * 1024 * 1024:
+            raise ValueError('Invalid or oversized run.json')
+        with archive.extractfile(manifest_member) as stream:
+            manifest = json.load(stream)
+        try:
+            require_preparation_metadata(manifest.get('normalization'))
+        except ValueError as error:
+            raise ValueError(f'{path}: {error}') from error
+        version = manifest.get('output_version')
+        if version not in (3, 4, 5, 6, 7, 8):
+            raise ValueError(f'Unsupported analysis output_version {version!r} in {root}/run.json; '
+                             'expected 3, 4, 5, 6, 7 or 8')
+        kind = manifest['analysis_signature']['type']
+        if kind not in ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter'):
+            raise ValueError('Unknown analysis type')
+        tree_only = manifest.get('tree_only', False)
+        if type(tree_only) is not bool or (tree_only and (version not in (7, 8) or not kind.startswith('disreplay'))):
+            raise ValueError('tree_only requires version-7/8 replay output')
+        required = ['run.json', 'normalization.csv']
+        if not tree_only:
+            required += ['histograms.npz', 'histogram_flows.csv']
+            required += (['cutflow.csv', 'pair_cutflow.csv', 'pair_composition_cutflow.csv']
+                         if kind.startswith('disreplay') else ['vertex_counts.csv'])
+            if kind.startswith('disreplay') and version < 6:
+                required += ['pairs.csv']
+            if version >= 4 and kind.startswith('disreplay'):
+                required += ['tagger_cutflow.csv']
+        if version >= 4 and kind.startswith('disreplay'):
+            required += ['events.root' if version >= 7 else 'events.jsonl' if version >= 6 else 'tagger_tracks.csv']
+        if set(required) & set(manifest.get('omitted_files', [])):
+            raise ValueError('Required analysis outputs were omitted')
+        for name in required:
+            member = archive.getmember(root + '/' + name)
+            if not member.isfile() or (member.size == 0 and not (
+                    name == 'events.jsonl' and manifest.get('entries_processed') == 0)):
+                raise ValueError(f'Missing or empty {name}')
+        processed = manifest['entries_processed']
+        if type(processed) is not int or processed < 0:
+            raise ValueError('Invalid entries_processed')
+        if manifest['chain_entry_stop'] - manifest['chain_entry_start'] != processed:
+            raise ValueError('Inconsistent chain entry range')
+        if not tree_only and manifest['config'].get('save_plots', True) and not any(
+                name.startswith(root + '/plots/') and name.endswith('.png') for name in names):
+            raise ValueError('Requested plots are missing')
+    return {'archive': path, 'directory': root, 'manifest': manifest}
+
+
+def validate_analysis_sources(results):
+    """Reject mixed settings, changed identities, and overlapping input ranges."""
+    if not results:
+        return
+    reference = results[0]['manifest']
+    intervals, identities, sizes = {}, {}, {}
+    for result in results:
+        manifest = result['manifest']
+        if manifest.get('tree_only', False) != reference.get('tree_only', False):
+            raise ValueError('Cannot mix tree-only and histogram outputs')
+        if any(manifest[key] != reference[key]
+               for key in ('output_version', 'analysis_signature', 'weight_definition')):
+            raise ValueError('Incompatible analysis settings/code; check and merge each configuration separately')
+        if manifest.get('event_record_schema') != reference.get('event_record_schema'):
+            raise ValueError('Incompatible analysis event-record diagnostics/schema')
+        processed = 0
+        for source in manifest['source_ranges']:
+            start, stop, entries = (source[key] for key in ('start', 'stop', 'entries'))
+            if any(type(value) is not int for value in (start, stop, entries)) or not 0 <= start < stop <= entries:
+                raise ValueError('Invalid source range')
+            path, uuid, tree = (source[key] for key in ('path', 'file_uuid', 'tree'))
+            expected = 'cbmsim' if manifest['analysis_signature']['type'].startswith('disreplay') else 'MuonDIS'
+            if not Path(path).is_absolute() or not uuid or tree != expected:
+                raise ValueError('Invalid source identity')
+            if identities.setdefault(path, uuid) != uuid:
+                raise ValueError(f'Source UUID changed: {path}')
+            for identity in (('path', path, tree), ('uuid', uuid, tree)):
+                intervals.setdefault(identity, []).append((start, stop))
+                if sizes.setdefault(identity, entries) != entries:
+                    raise ValueError(f'Source entry count changed: {path}')
+            processed += stop - start
+        if processed != manifest['entries_processed']:
+            raise ValueError('Source ranges do not match entries_processed')
+    for identity, ranges in intervals.items():
+        previous = -1
+        for start, stop in sorted(ranges):
+            if start < previous:
+                raise ValueError(f'Overlapping source entries: {identity[1]}')
+            previous = stop
+
+
+def check_event_tree(result, fairship):
+    """Validate the current FairShip DIS schema and scan only scalar path lengths."""
+    import ROOT
+
+    manifest = result['manifest']
+    if manifest['output_version'] not in (7, 8) or not manifest['analysis_signature']['type'].startswith('disreplay'):
+        raise ValueError('--check-root requires version-7/8 replay analysis')
+    module_path = Path(fairship) / 'newMuonDIS/analysisTree.py'
+    spec = importlib.util.spec_from_file_location('workflow_analysis_tree', module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with tempfile.TemporaryDirectory(prefix='check-analysis-') as temporary:
+        path = Path(temporary) / 'events.root'
+        with tarfile.open(result['archive'], 'r:gz') as archive, path.open('wb') as output:
+            with archive.extractfile(result['directory'] + '/events.root') as source:
+                shutil.copyfileobj(source, output)
+        file = ROOT.TFile.Open(str(path), 'READ')
+        if not file:
+            raise ValueError('Cannot open analysis events.root')
+        try:
+            if file.IsZombie() or file.TestBit(ROOT.TFile.kRecovered):
+                raise ValueError('Corrupt or recovered analysis events.root')
+            tree = file.Get(module.TREE_NAME)
+            module.validate_tree(tree, path)
+            if int(tree.GetEntries()) != manifest['entries_processed']:
+                raise ValueError('Analysis ROOT entries differ from entries_processed')
+            return path_statistics(tree, analysis=True, scan=True)
+        finally:
+            file.Close()
+
+
+def merge_analysis(results, args):
+    """Keep unpacked inputs for provenance and invoke FairShip's existing merger."""
+    validate_analysis_sources(results)
+    if args.skip_event_records and any(result['manifest'].get('tree_only', False) for result in results):
+        raise ValueError('Cannot omit event records from a tree-only merge; set skip_event_records: false')
+    if args.skip_tagger_tracks and any(result['manifest']['output_version'] >= 6 for result in results):
+        raise ValueError('Use --skip-event-records for analysis output version 6 or later')
+    destination = args.merge_output.expanduser().resolve()
+    unpack = (args.unpack_dir or destination.with_name(destination.name + '_inputs')).expanduser().resolve()
+    if not args.merger.is_file():
+        raise ValueError(f'Merger not found: {args.merger}')
+    if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+        raise ValueError(f'Merge output must be new or empty: {destination}')
+    if destination == unpack or unpack in destination.parents or destination in unpack.parents:
+        raise ValueError('Merge output and unpack directory must be separate')
+    unpack.mkdir(parents=True, exist_ok=True)
+    if any(unpack.iterdir()):
+        unpack = Path(tempfile.mkdtemp(prefix='merge_', dir=unpack))
+    print(f'Retaining merge inputs in {unpack}', flush=True)
+    inputs = []
+    for index, result in enumerate(results):
+        events = 'events.root' if result['manifest']['output_version'] >= 7 else 'events.jsonl'
+        omitted = events if args.skip_event_records else 'tagger_tracks.csv' if args.skip_tagger_tracks else None
+        folder = unpack / str(index)
+        folder.mkdir()
+        with tarfile.open(result['archive'], 'r|gz') as archive:
+            # read_analysis_archive has rejected traversal, links and special files.
+            # Copy regular files explicitly (also works with older Python tarfile).
+            for member in archive:
+                parts = Path(member.name).parts
+                if (not parts or Path(member.name).is_absolute() or '..' in parts
+                        or parts[0] != result['directory']
+                        or not (member.isfile() or member.isdir())):
+                    raise ValueError(f'Unsafe archive member: {member.name}')
+                if omitted and parts == (result['directory'], omitted):
+                    print(f'Skipping {member.name} ({member.size / 1024**2:.1f} MiB unpacked)', flush=True)
+                    continue
+                target = folder / member.name
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.extractfile(member) as source, target.open('xb') as output:
+                        shutil.copyfileobj(source, output)
+        directory = folder / result['directory']
+        if omitted and result['manifest']['analysis_signature']['type'].startswith('disreplay'):
+            manifest_path = directory / 'run.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['omitted_files'] = sorted(set(manifest.get('omitted_files', [])) | {omitted})
+            manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+        inputs.append(str(directory))
+    command = [sys.executable, str(args.merger), *inputs, '-o', str(destination)]
+    if args.no_plots:
+        command.append('--no-plots')
+    if args.skip_tagger_tracks:
+        command.append('--skip-tagger-tracks')
+    if args.skip_event_records:
+        command.append('--skip-event-records')
+    print(f'Running merger on {len(inputs)} validated outputs', flush=True)
+    subprocess.run(command, check=True)
+
+
+def check_analysis(args, base):
+    problems, results = [], []
+    discovered = 0
+    for job_id in range(args.first_job, args.first_job + args.num_jobs):
+        job_dir = base / str(job_id)
+        try:
+            logs = subjob_logs(job_dir, include_unsplit=True)
+            if not logs:
+                raise ValueError('no subjobs found')
+        except (OSError, ValueError) as error:
+            problems.append(f'{job_id}: {error}')
+            continue
+        for subjob_id, logfile in logs:
+            discovered += 1
+            label = f'{job_id}/{subjob_id}'
+            try:
+                text = logfile.read_text(errors='replace')
+                exits = re.findall(r'^Exit code:\s*(-?\d+)\s*$', text, re.MULTILINE)
+                if not exits or int(exits[-1]) != 0:
+                    raise ValueError('missing or nonzero exit code')
+                if 'INFO: Finished running. These files are on the WN:' not in text:
+                    raise ValueError('missing worker completion')
+                outputs = re.findall(r'^Output: (.+)\s*$', text, re.MULTILINE)
+                if len(outputs) != 1:
+                    raise ValueError('missing or ambiguous analysis completion')
+                locations = (logfile.parent / '__postprocesslocations__').read_text()
+                if re.search(r'^massstorage\s+\S+\s+ERROR\b', locations, re.MULTILINE):
+                    raise ValueError('Ganga output transfer failed')
+                archives = re.findall(r'^massstorage\s+\S+\s+(.+\.tar\.gz)\s*$', locations, re.MULTILINE)
+                if len(archives) != 1:
+                    raise ValueError('missing or ambiguous transferred analysis archive')
+                result = read_analysis_archive(archives[0].strip())
+                if result['directory'] != Path(outputs[0].strip()).name:
+                    raise ValueError('Transferred archive differs from analysis log output')
+                # Check each manifest before including its counts.
+                validate_analysis_sources([result])
+                if getattr(args, 'check_root', False):
+                    result['path_statistics'] = check_event_tree(result, args.fairship)
+                results.append(result)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, tarfile.TarError, EOFError) as error:
+                problems.append(f'{label}: {error}')
+    print(f'Analysis jobs {args.first_job}–{args.first_job + args.num_jobs - 1}')
+    print(f'Successful outputs: {len(results)}/{discovered}')
+    print('Checks: worker completion, transfer, archive structure, run.json and required files.')
+    print('DIS tree schema/count and scalar path-length baskets validated.'
+          if getattr(args, 'check_root', False) else 'No ROOT event reads.')
+    if results:
+        print_stats('Analysis entries processed', [item['manifest']['entries_processed'] for item in results])
+        print_path_statistics([item.get('path_statistics', {}) for item in results])
+    compatible = True
+    try:
+        validate_analysis_sources(results)
+    except (ValueError, KeyError, TypeError) as error:
+        compatible = False
+        problems.append(str(error))
+    if problems:
+        print('Jobs/outputs requiring attention:')
+        print('\n'.join(problems))
+    if args.merge_output:
+        if not results or not compatible or (problems and not args.merge_successful):
+            print('Merge not run: resolve problems or use --merge-successful to merge valid outputs only.')
+            return 1
+        try:
+            merge_analysis(results, args)
+        except (OSError, ValueError, subprocess.CalledProcessError, tarfile.TarError, EOFError) as error:
+            print(f'Merge failed: {error}')
+            return 1
+    return 1 if problems or not results else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('path', type=Path, help='Directory containing numbered Ganga master jobs')
+    parser.add_argument('--first-job', type=int, required=True)
+    parser.add_argument('--num-jobs', type=int, required=True)
+    parser.add_argument('--check-root', action='store_true',
+                        help='Validate events.root schema/count and scalar path-length baskets')
+    parser.add_argument('--fairship', type=Path,
+                        default=Path('/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs'),
+                        help='FairShip installation supplying the analysisTree schema')
+    parser.add_argument('--merge-output', type=Path, help='Run mergeAnalysis.py into this new/empty directory')
+    parser.add_argument('--unpack-dir', type=Path,
+                        help='Directory for retained merge inputs; creates a unique subdirectory if nonempty '
+                             '(default: MERGE_OUTPUT_inputs)')
+    parser.add_argument('--merger', type=Path,
+                        default=Path('/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs/newMuonDIS/mergeAnalysis.py'))
+    parser.add_argument('--no-plots', action='store_true', help='Skip rendering merged plots')
+    parser.add_argument('--skip-tagger-tracks', action='store_true',
+                        help='Skip extracting and merging tagger_tracks.csv; retain original archives '
+                             'and merge all histograms and summary tables')
+    parser.add_argument('--skip-event-records', action='store_true',
+                        help='Skip extracting/merging events.root (legacy: events.jsonl); '
+                             'retain histograms and summary tables; invalid for tree-only inputs')
+    parser.add_argument('--merge-successful', action='store_true',
+                        help='Explicitly allow a partial merge of valid jobs')
+    args = parser.parse_args()
+    if args.skip_event_records and args.skip_tagger_tracks:
+        parser.error('Choose --skip-event-records or --skip-tagger-tracks')
+    if not args.merge_output and (args.unpack_dir or args.no_plots or args.skip_tagger_tracks
+                                  or args.skip_event_records or args.merge_successful):
+        parser.error('--unpack-dir, --no-plots, --skip-event-records, --skip-tagger-tracks and --merge-successful require --merge-output')
+    base = args.path.expanduser()
+    if not base.is_dir():
+        parser.error(f'Not a directory: {base}')
+    if args.first_job < 0 or args.num_jobs <= 0:
+        parser.error('--first-job must be nonnegative and --num-jobs must be positive')
+    args.merger = args.merger.expanduser().resolve()
+    return check_analysis(args, base)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

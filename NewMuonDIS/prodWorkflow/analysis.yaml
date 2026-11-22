@@ -1,10 +1,12 @@
-# One checked replayfilter master per Ganga master by default.
+# Combine all checked replayfilter masters into one analysis job by default.
 step: analysis
 # upstream: replayfilter
+masters_per_job: -1           # All checked masters; positive values set a batch size.
 analysis:
   tree_only: true            # Extract events.root; fill histograms once after merging.
-  weight_factor: 3.6e-6
-  target_sum_weights: 6241572595.8004637    # null = no target scaling; set the full-production muon weight sum.
+  cross_section: stored      # Use muDIS_xsec written by replayfilter.
+  weight_factor: 1
+  target_sum_weights: 3.4428233e+09    # null = no target scaling; set the full-production muon weight sum.
   # failed_job_factor: 1.0
   # save_plots: false         # Render once at merge time.
   # geometry_file: null       # Checked companion geometry; an absolute override is supported.
@@ -13,9 +15,9 @@ analysis:
   #   y: [-500, 500, 500]
   #   z: [2000, 10000, 800]
 # type is inherited from replayfilter provenance, never supplied manually.
-# Version 7 writes events.root (DIS TTree) and a small run.json manifest.
+# Version 8 writes events.root (DIS TTree) and a small run.json manifest.
 
-# first_event: 0               # Zero-based entry; applies to each checked input.
+# first_event: 0               # Zero-based entry in each grouped input chain.
 # events_per_file: -1          # All remaining CHECKED entries; finite values cap the range.
 # events_per_subjob: null      # null = one range; set a size to split by entry count.
 # n_subjobs: null              # Alternative: divide into N balanced ranges. Do not set both.

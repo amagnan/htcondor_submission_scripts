@@ -10,7 +10,7 @@ import tempfile
 import uuid
 
 from prodWorkflow.config import signature
-from productionState import state_lock
+from prodWorkflow.productionState import state_lock
 
 
 def timestamp():
@@ -51,13 +51,19 @@ def verify(files):
 
 
 class State:
-    def __init__(self, settings):
+    def __init__(self, settings, fresh=False, inspect_existing=False):
         self.path = Path(settings['step_dir']) / 'state.json'
         self.settings = settings
-        if self.path.exists():
+        if not fresh and self.path.exists():
             self.data = json.loads(self.path.read_text())
-            if self.data.get('version') != 1 or self.data.get('configuration') != signature(settings):
-                raise ValueError(f'Settings differ from {self.path}; use the original YAML or a new production/name')
+            configuration = signature(settings)
+            saved = self.data.get('configuration', {})
+            # Checks inspect recorded tasks, including productions predating diagnostics.
+            # Do not migrate the saved signature or relax submission/retry checks.
+            if inspect_existing and settings['step'] == 'replayfilter' and 'diagnostics' not in saved:
+                configuration.pop('diagnostics', None)
+            if self.data.get('version') != 1 or saved != configuration:
+                raise ValueError(f'Settings differ from {self.path}; use the original YAML, rerun, or a new production/name')
         else:
             self.data = dict(version=1, id=uuid.uuid4().hex, configuration=signature(settings),
                              groups=[], attempts=[], revision=0)

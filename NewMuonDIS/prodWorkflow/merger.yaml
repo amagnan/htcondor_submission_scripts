@@ -1,11 +1,15 @@
 # Run locally through the same entry point: ./gangaSubmit.sh merger.yaml --submit.
 step: merger
+merge_replayfilter: true      # Also merge whole filtered inputs; publish to their common parent/merged.
+# defer_diagnostics: true     # Use a new name (or merger_fast.yaml); run merge-diagnostics later.
 # upstream: analysis
 skip_event_records: false     # Required for tree-only inputs; fast ROOT basket merging.
 summarize: true               # After tree-only merging, write MERGE_OUTPUT_summary.
-save_plots: true              # Render in the summary; false still writes tables/histograms.
-# merge_output: null          # Default: OUTPUT_BASE/TAG/PRODUCTION/MODE/merger/merged.
+save_plots: false             # Set true to render plots; tables/histograms are always written.
+# Local results by default; add --writeToEOS to use OUTPUT_BASE instead.
+# merge_output: null          # Default: YAML_DIR/results/TAG/PRODUCTION/MODE/NAME/merged.
 # unpack_dir: null            # Default: merge_output + "_inputs"; retained for provenance.
+# Explicit merge_output/unpack_dir override the local/EOS defaults.
 # Explicit merge_output/unpack_dir get a "_test" suffix with --test.
 # Destination must be new/empty. Set a different path for a subsequent merge.
 # require_complete: true      # false explicitly allows merging successful analysis ranges only.

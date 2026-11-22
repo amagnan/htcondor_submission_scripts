@@ -10,8 +10,10 @@ import subprocess
 import sys
 
 # In Ganga these modules are copied into the input sandbox alongside this worker.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from wn_script_pixi import archive_analysis
+if __package__:
+    from .wn_script_pixi import archive_analysis
+else:
+    from wn_script_pixi import archive_analysis
 
 
 def run(spec, prepare_only=False):
@@ -41,6 +43,10 @@ def run(spec, prepare_only=False):
         script = Path(spec['fs_install']) / spec['runfile']
     command = ['bash', '/cvmfs/ship-nightlies.cern.ch/pixi/pixi-cvmfs', spec['fs_install'],
                'python3', '-u', '-X', 'faulthandler', str(script), *spec['args']]
+    if 'random_seed' in spec:
+        seed = spec['random_seed']
+        print(f'INFO: Random seed: {seed["value"]} (production={seed["production"]}, '
+              f'master={seed["master_job"]}, subjob={seed["subjob"]})', flush=True)
     print('INFO: Executing: ' + shlex.join(command), flush=True)
     if prepare_only:
         return

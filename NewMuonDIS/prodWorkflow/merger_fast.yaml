@@ -1,0 +1,9 @@
+# Baseline first: ./gangaSubmit.sh merger_fast.yaml --submit
+# Diagnostics later: ./gangaSubmit.sh merge-diagnostics merger_fast.yaml --submit
+step: merger
+name: merger_fast
+merge_replayfilter: true
+defer_diagnostics: true
+skip_event_records: false
+summarize: true
+save_plots: false

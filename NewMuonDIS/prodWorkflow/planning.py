@@ -5,7 +5,7 @@ from itertools import islice
 import json
 from pathlib import Path
 
-from gangaProdScript import executable_options
+from prodWorkflow.gangaProdScript import executable_options
 from prodWorkflow.config import EXECUTABLES, PARENTS
 from prodWorkflow.state import digest, fingerprint, verify
 
@@ -56,6 +56,31 @@ def ranges(settings, entries):
     return result
 
 
+def analysis_inputs(settings, records, state=None):
+    """Group unassigned checked masters, retaining their IDs and file identities."""
+    assigned = {parent for group in state.data['groups']
+                for parent in group['inputs'].get('parents', [group['parent']])} if state is not None else set()
+    records = sorted((record for record in records if record['id'] not in assigned), key=lambda record: record['id'])
+    size = settings['masters_per_job']
+    if size == -1:
+        size = len(records) or 1
+    seen = set()
+    for offset in range(0, len(records), size):
+        batch = records[offset:offset + size]
+        if len({record['replay_type'] for record in batch}) != 1:
+            raise ValueError('Cannot group analysis inputs with different replay types')
+        sources = [source for record in batch for source in record['sources']]
+        for source in sources:
+            if source in seen:
+                raise ValueError(f'Duplicate analysis source: {source}')
+            seen.add(source)
+        parents = [record['id'] for record in batch]
+        yield dict(id=digest(parents), parents=parents, sources=sources,
+                   files=[item for record in batch for item in record['files']],
+                   geometries=[path for record in batch for path in record.get('geometries', [])],
+                   entries=sum(record['entries'] for record in batch), replay_type=batch[0]['replay_type'])
+
+
 def plan(settings, state=None):
     step = settings['step']
     limit = 1 if settings['test'] else settings['n_jobs']
@@ -76,6 +101,8 @@ def plan(settings, state=None):
         inputs = upstream(settings, verify_files=False)['records']
     if settings['test']:
         inputs = islice(inputs, 1)
+    if step == 'analysis' and settings['masters_per_job'] != 1:
+        inputs = analysis_inputs(settings, inputs, state)
     groups = []
     found = False
     for record in inputs:
@@ -92,9 +119,9 @@ def plan(settings, state=None):
             verify(record['files'])
         group = dict(id=group_id, parent=record['id'], inputs=record, units=[])
         if step == 'replayfilter':
-            if settings['first_event'] != 0 or settings['events_per_file'] != -1 or settings['n_subjobs'] or settings['events_per_subjob']:
-                raise ValueError('replayfilter consumes whole checked replay masters; do not split or limit ranges')
-            selected_ranges = [(0, min(100, record['entries']) if settings['test'] else record['entries'])]
+            if settings['first_event'] != 0 or settings['n_subjobs'] or settings['events_per_subjob']:
+                raise ValueError('replayfilter requires one unsplit chain starting at entry 0')
+            selected_ranges = ranges(settings, record['entries'])
         else:
             selected_ranges = ranges(settings, record['entries'])
         for first, count in selected_ranges:
@@ -114,7 +141,10 @@ def plan(settings, state=None):
                 paths = record['sources']
                 geometry = settings['geometry_file']
                 spec['filter'] = dict(sources=paths, geometry_files=[geometry] * len(paths) if geometry else record['geometries'],
-                                      master=record['master'], test=settings['test'])
+                                      master=record['master'], test=settings['test'],
+                                      diagnostics=settings['diagnostics'])
+                if 'cross_section' in settings:
+                    spec['filter']['cross_section'] = settings['cross_section']
                 spec['filter']['master_digest'] = hashlib.sha256(json.dumps(paths).encode()).hexdigest()
                 spec['output'] = stem + '_' + record['replay_type'] + '_filtered.root'
                 spec['outputs'] = [spec['output'], 'geo_' + spec['output'], str(Path(spec['output']).with_suffix('.json'))]

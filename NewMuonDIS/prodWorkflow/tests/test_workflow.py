@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,6 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / 'tests'))
 from test_checkReplay import SUCCESS_LOG
 from test_checkPrepareEventsOutputs import SUCCESS_LOG as PREPARE_LOG
 from test_checkFilterOutputs import SUCCESS_LOG as FILTER_LOG
@@ -125,6 +125,8 @@ class WorkflowTests(unittest.TestCase):
                     import re
                     log = re.sub(r'Generating\s+\d+\s+DIS events, first event\s+\d+',
                                  f'Generating {spec["count"]} DIS events, first event {spec["first"]}', log)
+                    command = ['python3', str(Path(spec['fs_install']) / spec['runfile']), *spec['args']]
+                    log = 'INFO: Executing: ' + shlex.join(command) + '\n' + log
                     (directory / 'stdout').write_text(log)
                     (directory / '__postprocesslocations__').write_text(''.join(f'massstorage *.root {p}\n' for p in paths))
 
@@ -283,6 +285,51 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Settings differ'):
             state.State(dict(changed, first_event=1))
 
+    def test_legacy_replayfilter_diagnostics_can_be_inspected_without_migration(self):
+        settings = self.settings('replayfilter')
+        saved = state.State(settings)
+        saved.data['configuration'].pop('diagnostics')
+        saved.save()
+        original = saved.path.read_bytes()
+        inspected = state.State(settings, inspect_existing=True)
+        self.assertEqual(inspected.data, saved.data)
+        self.assertEqual(saved.path.read_bytes(), original)
+        with self.assertRaisesRegex(ValueError, 'Settings differ'):
+            state.State(settings)
+        for change in (dict(cross_section='analytical'), dict(geometry_file='/different.root'),
+                       dict(first_event=1)):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'Settings differ'):
+                state.State(dict(settings, **change), inspect_existing=True)
+
+    def test_recorded_diagnostics_changes_still_rejected_when_inspecting(self):
+        settings = self.settings('replayfilter', diagnostics=False)
+        state.State(settings).save()
+        with self.assertRaisesRegex(ValueError, 'Settings differ'):
+            state.State(dict(settings, diagnostics=True), inspect_existing=True)
+
+    def test_legacy_replayfilter_check_handoff_and_status(self):
+        settings = self.settings('replayfilter')
+        saved = state.State(settings)
+        saved.data['configuration'].pop('diagnostics')
+        saved.data['groups'] = [dict(id='group', units=[dict(id='unit')])]
+        saved.data['attempts'] = [dict(id='attempt', job_id=100, phase='submitted',
+                                      units={'unit': None}, statuses={'unit': 'completed'})]
+        saved.save()
+        with patch.object(checking, 'check', return_value=0) as check:
+            self.assertEqual(workflow.main(['check', settings['config_file'], '--metadata']), 0)
+        self.assertEqual(check.call_args.args[0].data['configuration'], saved.data['configuration'])
+        self.assertEqual(check.call_args.args[1:], (True, False, False))
+        argv = ['check', settings['config_file'], '--metadata']
+        with patch.object(workflow, 'fairship', return_value=0) as fairship:
+            self.assertEqual(workflow.main(argv, self.api()), 0)
+        self.assertEqual(fairship.call_args.args[1], argv)
+        self.assertEqual(json.loads(saved.path.read_text())['configuration'], saved.data['configuration'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(['status', settings['config_file']]), 0)
+        for action in ('plan', 'retry'):
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, 'Settings differ'):
+                workflow.main([action, settings['config_file']])
+
     def test_submit_records_job_before_backend_and_sets_resources(self):
         saved, api = self.submitted(self.settings())
         job = api.registry[100]
@@ -298,6 +345,75 @@ class WorkflowTests(unittest.TestCase):
             submission.submit(saved, planning.select(saved), self.api(fail=True))
         self.assertEqual(json.loads(saved.path.read_text())['attempts'][0]['phase'], 'uncertain')
         self.assertEqual(planning.select(saved, retry=True), [])
+
+    def test_disgen_seed_pairing_is_unique_and_bounded(self):
+        self.assertEqual(submission.disgen_seed('261112', 100, 0), 266163)
+        self.assertEqual(submission.disgen_seed('261112', 100, 1), 266265)
+        self.assertNotEqual(submission.disgen_seed('261112', 100, 1),
+                            submission.disgen_seed('261112', 101, 0))
+        for production in ('261112', 'unit_test', '899999998'):
+            seeds = {submission.disgen_seed(production, master, child)
+                     for master in range(100) for child in range(100)}
+            self.assertEqual(len(seeds), 10000)
+            self.assertTrue(all(1 <= seed <= 899999999 for seed in seeds))
+        # Invert the pairing at the largest supported value and just beyond it.
+        from math import isqrt
+        for pair in (899999998, 899999999):
+            diagonal = (isqrt(8 * pair + 1) - 1) // 2
+            child = pair - diagonal * (diagonal + 1) // 2
+            master = diagonal - child
+            if pair == 899999998:
+                self.assertEqual(submission.disgen_seed('0', master, child), 899999999)
+            else:
+                with self.assertRaisesRegex(ValueError, 'collision-free'):
+                    submission.disgen_seed('0', master, child)
+        for master, child in ((-1, 0), (0, -1), (True, 0)):
+            with self.assertRaisesRegex(ValueError, 'nonnegative integers'):
+                submission.disgen_seed('261112', master, child)
+
+    def test_disgen_submission_saves_and_logs_each_seed(self):
+        saved, api = self.submitted(self.settings(production='261112'))
+        tasks = [json.loads(Path(path).read_text()) for path in api.registry[100].inputfiles
+                 if path.endswith('.json')]
+        self.assertEqual([task['random_seed']['value'] for task in tasks], [266163, 266265, 266368])
+        for child, spec in enumerate(tasks):
+            self.assertEqual(spec['args'][-2:], ['--seed', str(spec['random_seed']['value'])])
+            self.assertEqual(spec['random_seed']['master_job'], 100)
+            self.assertEqual(spec['random_seed']['subjob'], child)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), patch.object(worker.subprocess, 'run') as run:
+                worker.run(spec, prepare_only=True)
+            run.assert_not_called()
+            self.assertIn(f'Random seed: {spec["random_seed"]["value"]} '
+                          f'(production=261112, master=100, subjob={child})', output.getvalue())
+        # Attempt-specific seeds must not leak into the reusable plan.
+        for unit in saved.data['groups'][0]['units']:
+            self.assertNotIn('--seed', unit['spec']['args'])
+        # Retrying a single range creates an unsplit master: its subjob index is 0.
+        group = saved.data['groups'][0]
+        repair = dict(group, units=[group['units'][1]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            submission.submit(saved, [repair], api)
+        path = next(path for path in api.registry[107].inputfiles if path.endswith('.json'))
+        retry = json.loads(Path(path).read_text())
+        self.assertEqual(retry['random_seed'], dict(value=266891, production='261112', master_job=107, subjob=0))
+        self.assertEqual(retry['args'].count('--seed'), 1)
+        # The original submitted task remains a reproducible record.
+        self.assertEqual(json.loads(Path(api.registry[100].inputfiles[1]).read_text()), tasks[1])
+
+    def test_disgen_seed_overrides_and_other_stages_are_preserved(self):
+        for value in (12345, None):
+            saved, api = self.submitted(self.settings(name=f'override_{value}', options={'--seed': value}))
+            spec = json.loads(Path(api.registry[100].inputfiles[0]).read_text())
+            self.assertNotIn('random_seed', spec)
+            self.assertEqual(spec['args'].count('--seed'), int(value is not None))
+            if value is not None:
+                self.assertEqual(spec['args'][spec['args'].index('--seed') + 1], str(value))
+        self.exported('disgen', [self.record()])
+        saved, api = self.submitted(self.settings('disreplay_gen'))
+        spec = json.loads(Path(api.registry[100].inputfiles[0]).read_text())
+        self.assertNotIn('random_seed', spec)
+        self.assertEqual(spec['args'][spec['args'].index('--seed') + 1], '0')
 
     def test_complete_replay_master_required_and_only_failed_range_retried(self):
         self.exported('disgen', [self.record(entries=6)])
@@ -331,6 +447,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(saved.status(first), 'running')
         self.assertEqual(planning.select(saved, retry=True), [])
 
+    def test_replay_input_muons_can_generate_more_dis_events(self):
+        self.exported('disgen', [self.record(entries=2)])
+        saved, _ = self.submitted(self.settings('disreplay_gen', events_per_file=2))
+        self.replay_logs(saved)
+        logfile = self.workspace / '100/output/stdout'
+        log = logfile.read_text().replace('Generating 2 DIS events', 'Generating 500 DIS events')
+        log = log.replace("'TimeDetPoint': 0}", "'TimeDetPoint': 0, 'UpstreamTaggerScoringPoint': 480}")
+        logfile.write_text(log)
+        with patch.object(checking.preparation, 'root_statistics',
+                          return_value=('successful', dict(written=500, normalization=deepcopy(NORMALIZATION)))), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(checking.check(saved), 0)
+        self.assertEqual(saved.checked()['records'][0]['entries'], 500)
+        self.assertIn('Restored UpstreamTaggerScoringPoint', output.getvalue())
+        # The generated DIS count must still agree with the output tree.
+        with patch.object(checking.preparation, 'root_statistics',
+                          return_value=('successful', dict(written=499, normalization=deepcopy(NORMALIZATION)))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(checking.check(saved, refresh=True), 1)
+        self.assertIn('ROOT entries differ', saved.checked()['problems'][0]['reason'])
+        for changed in (log.replace('-n 2', '-n 3'), log.replace('-i 0', '-i 1'),
+                        log.replace('first event 0', 'first event 1'),
+                        '\n'.join(log.splitlines()[1:]), log.splitlines()[0] + '\n' + log):
+            with self.subTest(log=changed):
+                logfile.write_text(changed)
+                self.assertEqual(self.check(saved), 1)
+                self.assertIn('range differs', saved.checked()['problems'][0]['reason'])
+
     def test_successful_checks_cache_metadata_until_files_change(self):
         self.exported('disgen', [self.record(entries=6)])
         saved, _ = self.submitted(self.settings('disreplay_gen', events_per_subjob=3))
@@ -341,6 +485,21 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(checking.preparation, 'root_statistics', side_effect=self.metadata) as metadata, contextlib.redirect_stdout(io.StringIO()):
             checking.check(saved, refresh=True)
         self.assertEqual(metadata.call_count, 2)
+
+    def test_old_checker_cache_and_full_replay_check_revalidate(self):
+        self.exported('disgen', [self.record(entries=6)])
+        saved, _ = self.submitted(self.settings('disreplay_gen', events_per_subjob=3))
+        self.replay_logs(saved)
+        self.assertEqual(self.check(saved), 0)
+        record = saved.checked()
+        record.pop('check_version')
+        state.write_json(saved.path.with_name('checked.json'), record)
+        with patch.object(checking.preparation, 'root_statistics', side_effect=self.metadata) as read, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(checking.check(saved), 0)
+        self.assertEqual(read.call_count, 2)
+        with patch.object(checking.preparation, 'root_statistics', side_effect=self.metadata) as read, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(checking.check(saved, full=True), 0)
+        self.assertTrue(all(call.kwargs['replay_paths'] for call in read.call_args_list))
 
     def test_foreign_transfer_and_bad_metadata_not_exported(self):
         self.exported('disgen', [self.record(entries=6)])
@@ -363,7 +522,18 @@ class WorkflowTests(unittest.TestCase):
         self.exported('disreplay_gen', [record])
         groups = planning.plan(self.settings('replayfilter'))
         self.assertEqual(groups[0]['units'][0]['spec']['filter']['sources'], record['sources'])
-        with self.assertRaisesRegex(ValueError, 'whole checked replay masters'):
+        self.assertTrue(groups[0]['units'][0]['spec']['filter']['diagnostics'])
+        disabled = planning.plan(self.settings('replayfilter', diagnostics=False))
+        self.assertFalse(disabled[0]['units'][0]['spec']['filter']['diagnostics'])
+        for mode in ('stored', 'analytical'):
+            settings = self.settings('replayfilter', cross_section=mode)
+            self.assertEqual(planning.plan(settings)[0]['units'][0]['spec']['filter']['cross_section'], mode)
+        for mode in ('constant', 'invalid', None, True):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'cross_section'):
+                self.settings('replayfilter', cross_section=mode)
+        with self.assertRaisesRegex(ValueError, 'only to replayfilter'):
+            self.settings('disreplay_gen', cross_section='analytical')
+        with self.assertRaisesRegex(ValueError, 'one unsplit chain'):
             planning.plan(self.settings('replayfilter', events_per_subjob=1))
         record = self.record(name='muonDis_a_disreplay_gen_filtered.root')
         record['replay_type'] = 'disreplay_gen'
@@ -384,6 +554,200 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue((scratch / 'analysis-config.json').is_file())
         finally:
             os.chdir(cwd)
+
+    def analysis_records(self, counts=(3, 5, 0)):
+        records = []
+        for index, entries in enumerate(counts):
+            record = self.record(entries=entries, identity=f'filter-{index}',
+                                 name=f'muonDis_{index}_disreplay_gen_filtered.root')
+            geometry = Path(record['sources'][0]).with_name('geo_' + Path(record['sources'][0]).name)
+            geometry.write_bytes(b'geometry')
+            record.update(replay_type='disreplay_gen', geometries=[str(geometry)])
+            record['files'].append(state.fingerprint(geometry))
+            records.append(record)
+        return records
+
+    def test_analysis_grouping_configuration_and_existing_state(self):
+        for value in (0, -2, True, 1.5, None, 'all'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'masters_per_job'):
+                self.settings('analysis', masters_per_job=value)
+        with self.assertRaisesRegex(ValueError, 'applies only to analysis'):
+            self.settings('replayfilter', masters_per_job=2)
+        self.assertEqual(self.settings('analysis')['masters_per_job'], -1)
+        settings = self.settings('analysis', masters_per_job=1)
+        saved = state.State(settings)
+        self.assertNotIn('masters_per_job', saved.data['configuration'])
+        saved.save()
+        self.assertEqual(state.State(self.settings('analysis', masters_per_job=1)).data['id'], saved.data['id'])
+        with self.assertRaisesRegex(ValueError, 'Settings differ'):
+            state.State(self.settings('analysis', masters_per_job=-1))
+
+    def test_analysis_cross_section_is_validated_and_passed_to_worker(self):
+        self.exported('replayfilter', self.analysis_records())
+        self.assertNotIn('cross_section', self.settings('analysis')['analysis'])
+        for mode in ('constant', 'analytical', 'stored'):
+            settings = self.settings('analysis', analysis=dict(cross_section=mode))
+            spec = planning.plan(settings)[0]['units'][0]['spec']
+            self.assertEqual(spec['analysis']['cross_section'], mode)
+        for mode in ('invalid', None, True):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'analysis.cross_section'):
+                self.settings('analysis', analysis=dict(cross_section=mode))
+
+    def test_analysis_all_masters_submit_one_job_and_stage_every_input(self):
+        records = self.analysis_records()
+        self.exported('replayfilter', records)
+        saved, api = self.submitted(self.settings('analysis', n_jobs=1))
+        self.assertEqual(len(api.registry), 1)
+        job = next(iter(api.registry.values()))
+        self.assertFalse(hasattr(job, 'splitter'))
+        group, = saved.data['groups']
+        unit, = group['units']
+        spec = unit['spec']
+        self.assertEqual(group['inputs']['parents'], [record['id'] for record in records])
+        self.assertEqual(spec['sources'], [record['sources'][0] for record in records])
+        self.assertEqual(spec['files'], [item for record in records for item in record['files']])
+        self.assertEqual((spec['first'], spec['count']), (0, 8))
+        scratch = self.base / 'scratch'
+        scratch.mkdir()
+        cwd = Path.cwd()
+        try:
+            os.chdir(scratch)
+            with contextlib.redirect_stdout(io.StringIO()), patch.object(worker.subprocess, 'run', side_effect=AssertionError('analysis executed')):
+                worker.run(spec, prepare_only=True)
+            for index, record in enumerate(records):
+                folder = scratch / 'analysis-input' / f'{index:06d}'
+                self.assertEqual(next(folder.glob('sim_*.root')).resolve(), Path(record['sources'][0]))
+                self.assertEqual(next(folder.glob('geo_*.root')).resolve(), Path(record['geometries'][0]))
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(planning.plan(saved.settings, saved), [])
+
+    def test_analysis_grouping_batches_and_chain_ranges(self):
+        records = self.analysis_records((3, 5, 7))
+        self.exported('replayfilter', list(reversed(records)))
+        groups = planning.plan(self.settings('analysis', masters_per_job=2, first_event=2,
+                                             events_per_file=5, events_per_subjob=3))
+        self.assertEqual([group['inputs']['parents'] for group in groups], [['filter-0', 'filter-1'], ['filter-2']])
+        for group in groups:
+            self.assertEqual([(unit['spec']['first'], unit['spec']['count']) for unit in group['units']], [(2, 3), (5, 2)])
+        groups = planning.plan(self.settings('analysis', masters_per_job=-1, n_subjobs=2))
+        self.assertEqual([unit['spec']['count'] for unit in groups[0]['units']], [8, 7])
+
+    def test_analysis_grouping_new_inputs_do_not_repeat_assigned_masters(self):
+        records = self.analysis_records((3, 5, 7))
+        upstream = self.exported('replayfilter', records[:2], complete=False)
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            planning.plan(self.settings('analysis', masters_per_job=-1))
+        saved, _ = self.submitted(self.settings('analysis', masters_per_job=-1, require_complete=False))
+        original = deepcopy(saved.data['groups'])
+        report = upstream.checked()
+        report['records'] = list(reversed(records))
+        state.write_json(upstream.path.with_name('checked.json'), report)
+        groups = planning.plan(saved.settings, saved)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]['inputs']['parents'], ['filter-2'])
+        self.assertEqual(groups[0]['units'][0]['spec']['count'], 7)
+        saved.add_groups(groups)
+        self.assertEqual(saved.data['groups'][:1], original)
+        self.assertEqual(planning.plan(saved.settings, saved), [])
+
+    def test_analysis_rerun_groups_successful_and_new_masters_together(self):
+        self.analysis_rerun(['rerun'], [])
+
+    def test_analysis_rerun_option_groups_successful_and_new_masters_together(self):
+        self.analysis_rerun([], ['--rerun'])
+
+    def analysis_rerun(self, prefix, options):
+        records = self.analysis_records((3, 5, 7))
+        upstream = self.exported('replayfilter', records[:2])
+        saved, api = self.submitted(self.settings('analysis', masters_per_job=1))
+        for attempt in saved.data['attempts']:
+            attempt['statuses'] = dict.fromkeys(attempt['units'], 'completed')
+            api.registry[attempt['job_id']].status = 'completed'
+        saved.save()
+        state.write_json(saved.path.with_name('checked.json'),
+                         dict(state_id=saved.data['id'], revision=saved.data['revision'],
+                              successful=[dict(unit=unit) for attempt in saved.data['attempts'] for unit in attempt['units']],
+                              problems=[]))
+        self.assertEqual(planning.select(saved), [])
+        report = upstream.checked()
+        report['records'] = records
+        state.write_json(upstream.path.with_name('checked.json'), report)
+        settings = self.settings('analysis')
+        args = [*prefix, settings['config_file'], *options]
+        checked = saved.path.with_name('checked.json')
+        before = {path: path.read_bytes() for path in (saved.path, checked, upstream.path,
+                                                     upstream.path.with_name('checked.json'))}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(args, api), 0)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(len(api.registry), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main([*args, '--submit'], api), 0)
+        current = state.State(settings)
+        self.assertNotEqual(current.data['id'], saved.data['id'])
+        self.assertFalse(checked.exists())
+        for path in (upstream.path, upstream.path.with_name('checked.json')):
+            self.assertEqual(path.read_bytes(), before[path])
+        group, = current.data['groups']
+        unit, = group['units']
+        self.assertEqual(group['inputs']['parents'], [record['id'] for record in records])
+        self.assertEqual(unit['spec']['count'], 15)
+        self.assertEqual(len(current.data['attempts']), 1)
+        self.assertEqual(len(api.registry), 3)
+        self.assertFalse(hasattr(api.registry[114], 'splitter'))
+
+    def test_analysis_grouping_test_mode_and_empty_inputs(self):
+        records = self.analysis_records((250, 500))
+        self.exported('replayfilter', records, test=True)
+        groups = planning.plan(self.settings('analysis', masters_per_job=-1, test=True))
+        spec = groups[0]['units'][0]['spec']
+        self.assertEqual(spec['sources'], records[0]['sources'])
+        self.assertEqual(spec['count'], 100)
+        self.exported('replayfilter', self.analysis_records((0, 0)))
+        groups = planning.plan(self.settings('analysis', masters_per_job=-1))
+        self.assertEqual(len(groups[0]['units']), 1)
+        self.assertEqual(groups[0]['units'][0]['spec']['count'], 0)
+
+    def test_analysis_grouping_rejects_mixed_duplicate_and_changed_inputs(self):
+        records = self.analysis_records()
+        records[1]['replay_type'] = 'disreplay_filter'
+        self.exported('replayfilter', records)
+        settings = self.settings('analysis', masters_per_job=-1)
+        with self.assertRaisesRegex(ValueError, 'different replay types'):
+            planning.plan(settings)
+        records[1]['replay_type'] = 'disreplay_gen'
+        duplicate = dict(records[0], id='duplicate')
+        self.exported('replayfilter', [*records, duplicate])
+        with self.assertRaisesRegex(ValueError, 'Duplicate analysis source'):
+            planning.plan(settings)
+        self.exported('replayfilter', records)
+        Path(records[-1]['sources'][0]).write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError, 'Checked file changed'):
+            planning.plan(settings)
+
+    def test_replayfilter_entry_limit_applies_once_to_the_chain(self):
+        for entries, test, expected in ((25000, False, 10000), (7000, False, 7000),
+                                        (0, False, 0), (25000, True, 100)):
+            with self.subTest(entries=entries, test=test):
+                record = self.record(entries=entries, name='sim_a_disreplay_gen.root')
+                other = self.record(name='sim_b_disreplay_gen.root')
+                record['sources'].extend(other['sources'])
+                record['files'].extend(other['files'])
+                record.update(master=str(self.base / 'prepared.root'), replay_type='disreplay_gen',
+                              geometries=['geo_a.root', 'geo_b.root'])
+                self.exported('disreplay_gen', [record], test=test)
+                settings = self.settings('replayfilter', test=test, events_per_file=10000)
+                groups = planning.plan(settings)
+                self.assertEqual(len(groups), 1)
+                self.assertEqual(len(groups[0]['units']), 1)
+                spec = groups[0]['units'][0]['spec']
+                self.assertEqual((spec['first'], spec['count']), (0, expected))
+                self.assertEqual(spec['args'][:4], ['-s', '0', '-n', str(expected)])
+                self.assertEqual(spec['filter']['sources'], record['sources'])
+                for invalid in (dict(first_event=1), dict(n_subjobs=2), dict(events_per_subjob=100)):
+                    with self.assertRaisesRegex(ValueError, 'one unsplit chain'):
+                        planning.plan(dict(settings, **invalid))
 
     def test_optional_filter_branch_requires_matching_checker(self):
         self.exported('disgen', [self.record()])
@@ -412,6 +776,102 @@ class WorkflowTests(unittest.TestCase):
             workflow.main([settings['config_file'], '--n-jobs', '2'])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             workflow.main([settings['config_file'], '--submit'])
+
+    def test_rerun_replaces_only_selected_step_and_preserves_previous_outputs(self):
+        record = self.record(name='replay.root')
+        geometry = self.base / 'geometry.root'
+        geometry.write_bytes(b'geometry')
+        record.update(master=str(self.base / 'prepared.root'), replay_type='disreplay_gen',
+                      geometries=[str(geometry)])
+        upstream = self.exported('disreplay_gen', [record])
+        downstream = self.exported('analysis', [])
+        test_state = self.exported('replayfilter', [], test=True)
+        saved, api = self.submitted(self.settings('replayfilter'))
+        old_attempt = saved.data['attempts'][0]
+        old_attempt['statuses'] = dict.fromkeys(old_attempt['units'], 'completed')
+        api.registry[old_attempt['job_id']].status = 'completed'
+        saved.save()
+        state.write_json(saved.path.with_name('checked.json'),
+                         dict(state_id=saved.data['id'], revision=saved.data['revision'],
+                              successful=[dict(unit=unit) for unit in old_attempt['units']], problems=[]))
+        self.assertEqual(planning.select(saved), [])
+        old_outputs = [Path(path) for paths in old_attempt['outputs'].values() for path in paths]
+        for path in old_outputs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'previous output')
+        protected = [path for other in (upstream, downstream, test_state)
+                     for path in (other.path, other.path.with_name('checked.json'))]
+        protected += list(saved.path.parent.glob('tasks/*/*.json')) + old_outputs
+        before = {path: path.read_bytes() for path in protected}
+        api.monitor = Mock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(['rerun', saved.settings['config_file'], '--submit'], api), 0)
+        current = state.State(saved.settings)
+        self.assertNotEqual(current.data['id'], saved.data['id'])
+        self.assertEqual(current.data['groups'], saved.data['groups'])
+        self.assertEqual(len(current.data['attempts']), 1)
+        self.assertNotEqual(current.data['attempts'][0]['id'], old_attempt['id'])
+        self.assertNotEqual(current.data['attempts'][0]['outputs'], old_attempt['outputs'])
+        self.assertFalse(current.path.with_name('checked.json').exists())
+        self.assertEqual(set(api.registry), {100, 107})
+        self.assertEqual(api.registry[100].status, 'completed')
+        api.monitor.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+
+    def test_rerun_preview_accepts_changed_settings_without_resetting_state(self):
+        saved, api = self.submitted(self.settings())
+        checked = saved.path.with_name('checked.json')
+        state.write_json(checked, dict(state_id=saved.data['id'], revision=saved.data['revision'],
+                                     successful=[], problems=[]))
+        changed = self.settings(first_event=1)
+        before = {path: path.read_bytes() for path in (saved.path, checked)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(['rerun', changed['config_file']], api), 0)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(len(api.registry), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(['rerun', changed['config_file'], '--submit'], api), 0)
+        current = state.State(changed)
+        self.assertEqual(current.data['groups'][0]['units'][0]['spec']['first'], 1)
+        self.assertFalse(checked.exists())
+
+    def test_rerun_planning_failure_preserves_state_and_checker_export(self):
+        record = self.record()
+        upstream = self.exported('disgen', [record])
+        saved, api = self.submitted(self.settings('disreplay_gen'))
+        checked = saved.path.with_name('checked.json')
+        state.write_json(checked, dict(state_id=saved.data['id'], revision=saved.data['revision'],
+                                     successful=[], problems=[]))
+        upstream.path.with_name('checked.json').unlink()
+        before = {path: path.read_bytes() for path in (saved.path, checked)}
+        with self.assertRaisesRegex(ValueError, 'Run check'):
+            workflow.main(['rerun', saved.settings['config_file'], '--submit'], api)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(len(api.registry), 1)
+
+    def test_rerun_test_mode_preserves_production_and_requires_ganga_to_submit(self):
+        production, _ = self.submitted(self.settings())
+        production_before = production.path.read_bytes()
+        saved, api = self.submitted(self.settings(test=True))
+        before = saved.path.read_bytes()
+        args = ['rerun', saved.settings['config_file'], '--test', '--submit']
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            workflow.main(args)
+        self.assertEqual(saved.path.read_bytes(), before)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(args, api), 0)
+        self.assertNotEqual(state.State(saved.settings).data['id'], saved.data['id'])
+        self.assertEqual(production.path.read_bytes(), production_before)
+
+    def test_rerun_option_rejects_merger_and_conflicting_actions(self):
+        settings = self.settings('merger')
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+            workflow.main([settings['config_file'], '--rerun', '--submit'])
+        self.assertIn('--rerun requires a production step YAML', error.getvalue())
+        self.assertFalse(Path(settings['step_dir']).exists())
+        for action in ('check', 'status', 'retry', 'merge'):
+            with self.subTest(action=action), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                workflow.main([action, settings['config_file'], '--rerun'])
 
     def test_workflow_launcher_help_does_not_start_ganga(self):
         result = subprocess.run(['bash', str(ROOT / 'prodWorkflow/gangaSubmit.sh'), 'retry', '--help'],
@@ -541,7 +1001,7 @@ class WorkflowTests(unittest.TestCase):
         import shutil
         sandbox = self.base / 'sandbox'
         sandbox.mkdir()
-        for source in (ROOT / 'prodWorkflow/worker.py', ROOT / 'wn_script_pixi.py'):
+        for source in (ROOT / 'prodWorkflow/worker.py', ROOT / 'prodWorkflow/wn_script_pixi.py'):
             shutil.copyfile(source, sandbox / source.name)
         spec = self.prepared().data['groups'][0]['units'][0]['spec']
         (sandbox / 'task.json').write_text(json.dumps(spec))
@@ -551,10 +1011,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('INFO: Executing:', result.stdout)
         self.assertIn('Exit code: 0', result.stdout)
 
-    def analysis_archive(self, tree_only=False, entries=3):
+    def test_workflow_runs_with_only_local_helpers(self):
+        import shutil
+        isolated = self.base / 'isolated'
+        package = isolated / 'prodWorkflow'
+        package.mkdir(parents=True)
+        for source in (ROOT / 'prodWorkflow').glob('*.py'):
+            shutil.copyfile(source, package / source.name)
+        code = '''
+import importlib
+from pathlib import Path
+import sys
+from types import ModuleType
+sys.path.insert(0, sys.argv[1])
+helpers = ('checkAnalysis', 'checkFilterOutputs', 'checkPrepareEventsOutputs',
+           'checkReplay', 'checkReplayFilter', 'gangaProdScript', 'jobTiming',
+           'preparationInputs', 'productionState', 'replayChain', 'replayProduction',
+           'replayfilter_worker', 'wn_script_pixi')
+# Legacy modules loaded by another application must not shadow local copies.
+for name in helpers:
+    sys.modules[name] = ModuleType(name)
+for name in (*helpers, 'workflow', 'checking', 'planning', 'state', 'worker'):
+    module = importlib.import_module('prodWorkflow.' + name)
+    assert Path(module.__file__).parent == Path(sys.argv[1]) / 'prodWorkflow'
+from prodWorkflow import checking, workflow
+assert checking.preparation.__name__ == 'prodWorkflow.checkPrepareEventsOutputs'
+try:
+    workflow.main(['--help'])
+except SystemExit as error:
+    assert error.code == 0
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(isolated)],
+                                cwd=isolated, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_submission_packages_local_worker_helpers(self):
+        saved, api = self.submitted(self.settings())
+        job = api.registry[100]
+        folder = ROOT / 'prodWorkflow'
+        self.assertEqual(job.application.exe, str(folder / 'worker.py'))
+        self.assertEqual([Path(path) for path in job.inputfiles if path.endswith('.py')],
+                         [folder / name for name in ('wn_script_pixi.py', 'replayfilter_worker.py', 'replayChain.py', 'replayDiagnostics.py')])
+
+    def analysis_archive(self, tree_only=False, entries=3, version=8):
         directory = self.base / 'analysis_evt0_3'
         directory.mkdir()
-        manifest = dict(output_version=7, tree_only=tree_only,
+        manifest = dict(output_version=version, tree_only=tree_only,
                         normalization=dict(preparation_complete=True, records=[dict(id='prepared-id', **NORMALIZATION['records']['prepared-id'])]),
                         analysis_signature=dict(type='disreplay_gen', sha256='analysis-code'),
                         config=dict(save_plots=False, tree_only=tree_only), entries_processed=entries, entries_available=entries,
@@ -592,13 +1094,125 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('--skip-event-records', run.call_args.args[0])
         self.assertEqual(json.loads(saved.path.read_text())['merge']['inputs'], [str(archive)])
 
+    def test_replayfilter_merge_preview_and_execution_are_wired_to_merger(self):
+        from prodWorkflow import replayMerge
+        record = self.analysis_archive(tree_only=True)
+        self.exported('analysis', [record])
+        saved = state.State(self.settings('merger', merge_replayfilter=True, summarize=False))
+        plan = dict(inputs=[dict(path='/filtered.root')], entries=3,
+                    destination=str(self.base / 'eos-common/merged'))
+        output = io.StringIO()
+        with patch.object(replayMerge, 'plan_merge', return_value=plan) as make_plan, \
+                patch.object(replayMerge, 'execute') as merge_filter, \
+                patch.object(checking.checkAnalysis, 'merge_analysis') as merge_analysis, \
+                contextlib.redirect_stdout(output):
+            workflow.merge(saved)
+            make_plan.assert_called_once_with([record['analysis']], test=False, defer_diagnostics=False)
+            merge_filter.assert_not_called()
+            merge_analysis.assert_not_called()
+            self.assertIn(plan['destination'], output.getvalue())
+            self.assertIn('whole replayfilter files', output.getvalue())
+            self.assertFalse(saved.path.exists())
+            workflow.merge(saved, execute=True)
+            local = self.base / 'results/TRY2026/unit_test/production/merger/replayfilter_merged'
+            merge_filter.assert_called_once_with(saved, plan, local)
+            merge_analysis.assert_called_once()
+        self.assertEqual(saved.data['merge']['inputs'], record['sources'])
+
+    def test_failed_replayfilter_transfer_precedes_analysis_merge(self):
+        from prodWorkflow import replayMerge
+        self.exported('analysis', [self.analysis_archive(tree_only=True)])
+        saved = state.State(self.settings('merger', merge_replayfilter=True, summarize=False))
+        plan = dict(inputs=[dict(path='/filtered.root')], entries=3,
+                    destination=str(self.base / 'eos-common/merged'))
+        with patch.object(replayMerge, 'plan_merge', return_value=plan), \
+                patch.object(replayMerge, 'execute', side_effect=OSError('transfer failed')), \
+                patch.object(checking.checkAnalysis, 'merge_analysis') as merge_analysis, \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(OSError, 'transfer failed'):
+            workflow.merge(saved, execute=True)
+        merge_analysis.assert_not_called()
+        self.assertNotIn('merge', saved.data)
+
+    def test_deferred_diagnostics_uses_saved_plan_without_analysis_or_upstream(self):
+        from prodWorkflow import replayMerge
+        saved = state.State(self.settings('merger', merge_replayfilter=True, defer_diagnostics=True))
+        with self.assertRaisesRegex(ValueError, 'Complete the baseline'):
+            workflow.merge_diagnostics(saved)
+        plan = dict(id='baseline', diagnostics=True, defer_diagnostics=True, inputs=[],
+                    destination=str(self.base / 'published/merged'))
+        saved.data['replayfilter_merge'] = dict(plan=plan, phase='published', local=str(self.base / 'local/baseline'))
+        saved.save()
+        with patch.object(workflow, 'upstream', side_effect=AssertionError('Must use saved plan')), \
+                patch.object(replayMerge, 'bundle_manifest') as validate, \
+                patch.object(replayMerge, 'execute') as execute, \
+                patch.object(checking.checkAnalysis, 'merge_analysis') as analysis, \
+                contextlib.redirect_stdout(io.StringIO()):
+            workflow.main(['merge-diagnostics', saved.settings['config_file']])
+            execute.assert_not_called()
+            validate.assert_not_called()
+            workflow.main(['merge-diagnostics', saved.settings['config_file'], '--submit'])
+            validate.assert_called_once_with(plan['destination'], plan)
+            self.assertEqual(execute.call_args.args[1], replayMerge.plan_diagnostics(plan))
+            self.assertEqual(execute.call_args.args[2], self.base / 'local/replayfilter_diagnostics')
+            analysis.assert_not_called()
+
     def test_tree_only_archive_accepts_zero_events_without_histograms(self):
         record = self.analysis_archive(tree_only=True, entries=0)
         checking.checkAnalysis.validate_analysis_sources([record['analysis']])
         self.assertTrue(record['analysis']['manifest']['tree_only'])
         self.assertFalse((self.base / 'analysis_evt0_3/histograms.npz').exists())
 
-    def test_version_seven_requires_nonempty_root_even_for_zero_events(self):
+    def test_version_seven_archive_remains_readable(self):
+        record = self.analysis_archive(tree_only=True, version=7)
+        checking.checkAnalysis.validate_analysis_sources([record['analysis']])
+        self.assertEqual(record['analysis']['manifest']['output_version'], 7)
+
+    def test_unsupported_analysis_versions_rejected_by_worker_and_checker(self):
+        record = self.analysis_archive(tree_only=True)
+        directory = self.base / 'analysis_evt0_3'
+        manifest = record['analysis']['manifest']
+        for version in (None, 2, 9):
+            with self.subTest(version=version):
+                manifest['output_version'] = version
+                (directory / 'run.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'Unsupported analysis output_version'):
+                    worker.archive_analysis(directory)
+                with tarfile.open(record['sources'][0], 'w:gz') as archive:
+                    archive.add(directory, arcname=directory.name)
+                with self.assertRaisesRegex(ValueError, 'Unsupported analysis output_version'):
+                    checking.checkAnalysis.read_analysis_archive(record['sources'][0])
+
+    def test_mixed_analysis_versions_rejected(self):
+        result = self.analysis_archive(tree_only=True)['analysis']
+        other = deepcopy(result)
+        other['manifest']['output_version'] = 7
+        with self.assertRaisesRegex(ValueError, 'Incompatible analysis settings/code'):
+            checking.checkAnalysis.validate_analysis_sources([result, other])
+
+    def test_version_eight_root_check_validates_schema_and_entry_count(self):
+        result = self.analysis_archive(tree_only=True)['analysis']
+        file = Mock()
+        file.IsZombie.return_value = file.TestBit.return_value = False
+        file.Get.return_value.GetEntries.return_value = 3
+        root = SimpleNamespace(TFile=SimpleNamespace(Open=Mock(return_value=file), kRecovered=2))
+        module = SimpleNamespace(TREE_NAME='DIS', validate_tree=Mock())
+        checker = checking.checkAnalysis
+        with patch.dict(sys.modules, ROOT=root), \
+                patch.object(checker.importlib.util, 'spec_from_file_location', return_value=Mock()), \
+                patch.object(checker.importlib.util, 'module_from_spec', return_value=module), \
+                patch.object(checker, 'path_statistics', return_value={'paths': 'checked'}) as statistics:
+            self.assertEqual(checker.check_event_tree(result, self.base), {'paths': 'checked'})
+            module.validate_tree.assert_called_once()
+            self.assertIs(module.validate_tree.call_args.args[0], file.Get.return_value)
+            statistics.assert_called_once_with(file.Get.return_value, analysis=True, scan=True)
+            file.Close.assert_called_once()
+            file.Get.return_value.GetEntries.return_value = 2
+            with self.assertRaisesRegex(ValueError, 'entries differ'):
+                checker.check_event_tree(result, self.base)
+            self.assertEqual(file.Close.call_count, 2)
+            self.assertEqual(statistics.call_count, 1)
+
+    def test_version_eight_requires_nonempty_root_even_for_zero_events(self):
         record = self.analysis_archive(tree_only=True, entries=0)
         directory = self.base / 'analysis_evt0_3'
         (directory / 'events.root').write_bytes(b'')
@@ -618,15 +1232,82 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'mix tree-only'):
             checking.checkAnalysis.validate_analysis_sources([result, combined])
 
+    def test_mixed_analysis_diagnostic_schemas_rejected(self):
+        result = self.analysis_archive(tree_only=True)['analysis']
+        other = deepcopy(result)
+        result['manifest']['event_record_schema'] = dict(stages=['entrance clearance >= 20 cm'])
+        other['manifest']['event_record_schema'] = dict(stages=['old clearance'])
+        with self.assertRaisesRegex(ValueError, 'diagnostics/schema'):
+            checking.checkAnalysis.validate_analysis_sources([result, other])
+
     def tree_merge(self, **settings):
         record = self.analysis_archive(tree_only=True)
-        self.exported('analysis', [record])
+        self.exported('analysis', [record], test=settings.get('test', False))
         install = self.base / 'FairShip/newMuonDIS'
         install.mkdir(parents=True)
         for script in ('mergeAnalysis.py', 'summarizeAnalysis.py'):
             (install / script).write_text('# test stub; subprocess mocked\n')
-        return state.State(self.settings('merger', fs_install=str(install.parent),
-                                         merge_output=str(self.base / 'merged'), **settings))
+        settings.setdefault('merge_output', str(self.base / 'merged'))
+        return state.State(self.settings('merger', fs_install=str(install.parent), **settings))
+
+    def assert_default_merge_locations(self, test=False):
+        saved = self.tree_merge(merge_output=None, test=test, name='custom_merger')
+        settings = saved.settings
+        mode = 'test' if test else 'production'
+        local = self.base / 'results' / settings['tag'] / settings['production'] / mode / settings['name']
+        for write_to_eos, parent in ((False, local), (True, Path(settings['output_dir']))):
+            with self.subTest(write_to_eos=write_to_eos):
+                # Exercise both the YAML shorthand and the explicit merge command.
+                argv = [settings['config_file'], '--submit']
+                if write_to_eos:
+                    argv = ['merge', *argv, '--writeToEOS']
+                if test:
+                    argv.append('--test')
+                with patch.object(workflow.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(workflow.main(argv), 0)
+                self.assertEqual(run.call_count, 2)
+                merge_command, summary_command = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(merge_command[-3:], ['-o', str(parent / 'merged'), '--no-plots'])
+                self.assertEqual(summary_command[2:], [str(parent / 'merged'), '-o', str(parent / 'merged_summary'), '--no-plots'])
+                self.assertTrue((parent / 'merged_inputs/0/analysis_evt0_3/events.root').is_file())
+                recorded = state.State(settings).data['merge']
+                self.assertEqual(recorded['output'], str(parent / 'merged'))
+                self.assertEqual(recorded['summary'], str(parent / 'merged_summary'))
+
+    def test_merge_defaults_to_local_with_eos_opt_in(self):
+        self.assert_default_merge_locations()
+
+    def test_merge_test_mode_has_separate_local_and_eos_folders(self):
+        self.assert_default_merge_locations(test=True)
+
+    def test_merge_explicit_paths_override_eos_flag_and_keep_test_suffix(self):
+        saved = self.tree_merge(test=True, unpack_dir=str(self.base / 'retained'), save_plots=True)
+        with patch.object(workflow.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+            workflow.merge(saved, execute=True, write_to_eos=True)
+        self.assertEqual(run.call_args_list[0].args[0][-2:], ['-o', str(self.base / 'merged_test')])
+        self.assertEqual(run.call_args_list[1].args[0][2:],
+                         [str(self.base / 'merged_test'), '-o', str(self.base / 'merged_test_summary')])
+        self.assertTrue((self.base / 'retained_test/0/analysis_evt0_3/events.root').is_file())
+
+    def test_merge_eos_flag_survives_ganga_handoff(self):
+        saved = self.tree_merge(merge_output=None)
+        argv = [saved.settings['config_file'], '--writeToEOS', '--submit']
+        with patch.object(workflow, 'fairship', return_value=0) as fairship:
+            self.assertEqual(workflow.main(argv, self.api()), 0)
+        self.assertEqual(fairship.call_args.args[1], ['plan', *argv])
+
+    def test_eos_flag_rejected_for_non_merger_step(self):
+        settings = self.settings()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            workflow.main([settings['config_file'], '--writeToEOS'])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_local_merge_preview_does_not_create_results(self):
+        saved = self.tree_merge(merge_output=None)
+        with patch.object(workflow.subprocess, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(['merge', saved.settings['config_file']]), 0)
+        run.assert_not_called()
+        self.assertFalse((self.base / 'results').exists())
 
     def test_tree_merge_then_summary_retains_root_and_records_both_outputs(self):
         saved = self.tree_merge(save_plots=False)
@@ -736,20 +1417,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(filtered.checked()['records'][0]['entries'], 2)
 
     def test_replayfilter_check_exports_even_zero_selected_entries(self):
-        record = self.record(name='sim_a_disreplay_gen.root')
+        self.check_replayfilter_empty_output(entries=10, limit=-1, processed=10)
+
+    def test_replayfilter_check_accepts_limited_processing(self):
+        self.check_replayfilter_empty_output(entries=25000, limit=10000, processed=10000)
+
+    def test_replayfilter_check_validates_analytical_mode(self):
+        self.check_replayfilter_empty_output(entries=10, limit=-1, processed=10, cross_section='analytical')
+
+    def check_replayfilter_empty_output(self, entries, limit, processed, cross_section=None):
+        record = self.record(entries=entries, name='sim_a_disreplay_gen.root')
         geometry = self.base / 'geo_a_disreplay_gen.root'
         geometry.write_bytes(b'geometry')
         record.update(master=str(self.base / 'prepared.root'), replay_type='disreplay_gen', geometries=[str(geometry)])
         record['files'].append(state.fingerprint(geometry))
         self.exported('disreplay_gen', [record])
-        saved, _ = self.submitted(self.settings('replayfilter'))
+        options = {} if cross_section is None else dict(cross_section=cross_section)
+        saved, _ = self.submitted(self.settings('replayfilter', events_per_file=limit, **options))
         unit = saved.data['groups'][0]['units'][0]
         output, geo, manifest_path = map(Path, saved.data['attempts'][0]['outputs'][unit['id']])
         output.parent.mkdir(parents=True)
         output.write_bytes(b'ROOT with zero selected entries')
         geo.write_bytes(b'geometry')
-        counts = dict(source_entry_start=0, source_entry_stop=10, entries_available=10,
-                      events_processed=10, events_two_tracks=0, events_selected=0)
+        counts = dict(source_entry_start=0, source_entry_stop=processed, entries_available=entries,
+                      events_processed=processed, events_two_tracks=0, events_selected=0)
+        if cross_section is not None:
+            counts['cross_section'] = cross_section
         payload = dict(version=2, production=unit['spec']['filter'],
                        filter=dict(counts, sources=[dict(counts, source_uuid='source-id', source_file=record['sources'][0])]),
                        output=output.name, geometry=geo.name, output_bytes=output.stat().st_size,
@@ -765,6 +1458,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(exported['entries'], 0)
         analysis = planning.plan(self.settings('analysis'))
         self.assertEqual(analysis[0]['units'][0]['spec']['count'], 0)
+        if cross_section is not None:
+            payload['filter']['cross_section'] = 'stored'
+            manifest_path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, 'cross section differs'):
+                checking.checkReplayFilter.read_filter_manifest(manifest_path)
 
 
 if __name__ == '__main__':

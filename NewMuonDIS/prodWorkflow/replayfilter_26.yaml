@@ -1,7 +1,11 @@
 # Chain every checked replay range belonging to one prepared DIS file.
 step: replayfilter
+cross_section: analytical     # Replace muDIS_xsec with sigma(muDIS_pPythia) in mb; stored preserves it.
+diagnostics: true             # Save per-source selection diagnostics and plots.
 upstream: disreplay_gen        # Use disreplay_filter for the optional branch.
-# geometry_file: null          # Default: checked companion geometry for each replay file.
+require_complete: false        # Wait for every upstream range; false explicitly accepts successful inputs only.
+n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
+geometry_file: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_50cm_before_end_MS/geo_38e81e44-f930-4da3-8c80-dfa3b693a616.root          # Default: checked companion geometry for each replay file.
 # No splitting/range options: one whole replay master per job.
 # To run both branches, copy this YAML and set name: replayfilter_filter,
 # upstream: disreplay_filter, then use that name as analysis.upstream.
@@ -9,8 +13,6 @@ upstream: disreplay_gen        # Use disreplay_filter for the optional branch.
 # Less commonly changed workflow settings (defaults shown).
 workflow: workflow_26.yaml       # Relative to this file.
 # name: STEP                   # Default: the step value; use a new name for a new selection.
-# require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
-# n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
 # Resource overrides inherit workflow.yaml; its defaults are:
 # max_runtime: 86000            # Seconds.
 # memory_mb: 3000

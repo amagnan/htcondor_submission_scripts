@@ -21,7 +21,7 @@ COMMON = dict(production='new_production', tag='TRY2026', state_dir='.state',
               accounting_group='group_u_SHIP.u_ship_cg')
 DEFAULTS = dict(name=None, upstream=None, require_complete=True, n_jobs=-1,
                 first_event=0, events_per_file=-1, events_per_subjob=None,
-                n_subjobs=None, input_dir=None, input_pattern='*sim_*.root',
+                n_subjobs=None, masters_per_job=1, input_dir=None, input_pattern='*sim_*.root',
                 geometry_file=None, options={}, analysis={},
                 skip_event_records=True, save_plots=True, merge_output=None,
                 unpack_dir=None)
@@ -58,7 +58,7 @@ def path_value(value, base):
 def load(path, test=False):
     path = Path(path).expanduser().resolve()
     supplied = mapping(path)
-    unknown = supplied.keys() - (COMMON.keys() | DEFAULTS.keys() | {'workflow', 'step', 'summarize'})
+    unknown = supplied.keys() - (COMMON.keys() | DEFAULTS.keys() | {'workflow', 'step', 'summarize', 'diagnostics', 'cross_section', 'merge_replayfilter', 'defer_diagnostics'})
     if unknown:
         raise ValueError(f'Unknown settings in {path.name}: {sorted(unknown)}')
     common_path = path.parent / supplied.get('workflow', 'workflow.yaml')
@@ -69,15 +69,31 @@ def load(path, test=False):
     step = settings.get('step')
     if step not in STEPS:
         raise ValueError(f'step must be one of {", ".join(STEPS)}')
+    if step == 'replayfilter':
+        settings['diagnostics'] = supplied.get('diagnostics', True)
+        if type(settings['diagnostics']) is not bool:
+            raise ValueError('diagnostics must be true or false')
+    elif 'diagnostics' in supplied:
+        raise ValueError('diagnostics applies only to replayfilter')
+    if 'cross_section' in supplied:
+        if step != 'replayfilter':
+            raise ValueError('Top-level cross_section applies only to replayfilter; use analysis.cross_section for analysis')
+        if supplied['cross_section'] not in ('stored', 'analytical'):
+            raise ValueError('replayfilter cross_section must be stored or analytical')
     only = {'input_pattern': ('disgen',), 'geometry_file': ('replayfilter',),
+            'masters_per_job': ('analysis',),
             'skip_event_records': ('merger',), 'save_plots': ('merger',), 'summarize': ('merger',),
-            'merge_output': ('merger',), 'unpack_dir': ('merger',)}
+            'merge_output': ('merger',), 'unpack_dir': ('merger',), 'merge_replayfilter': ('merger',),
+            'defer_diagnostics': ('merger',)}
     for key, steps in only.items():
         if key in supplied and step not in steps:
             raise ValueError(f'{key} applies only to {", ".join(steps)}')
+    if step == 'analysis':
+        settings['masters_per_job'] = supplied.get('masters_per_job', -1)
     if step == 'merger':
         # Keep unrelated upstream stages compatible with their saved settings.
         settings['skip_event_records'] = supplied.get('skip_event_records', False)
+        settings['save_plots'] = supplied.get('save_plots', False)
         settings['summarize'] = supplied.get('summarize', True)
     if step == 'merger' and any(key in supplied for key in ('first_event', 'events_per_file', 'events_per_subjob', 'n_subjobs')):
         raise ValueError('merger consumes checked archives; it does not split event ranges')
@@ -96,7 +112,7 @@ def load(path, test=False):
     for key in ('max_runtime', 'memory_mb', 'disk_mb', 'cpus'):
         if type(settings[key]) is not int or settings[key] <= 0:
             raise ValueError(f'{key} must be a positive integer')
-    for key in ('n_jobs', 'events_per_file'):
+    for key in ('n_jobs', 'events_per_file', 'masters_per_job'):
         if type(settings[key]) is not int or settings[key] not in (-1,) and settings[key] <= 0:
             raise ValueError(f'{key} must be positive or -1')
     if type(settings['first_event']) is not int or settings['first_event'] < 0:
@@ -106,9 +122,11 @@ def load(path, test=False):
             raise ValueError(f'{key} must be null or a positive integer')
     if settings['n_subjobs'] is not None and settings['events_per_subjob'] is not None:
         raise ValueError('Choose n_subjobs or events_per_subjob')
-    for key in ('require_complete', 'skip_event_records', 'save_plots', 'summarize'):
+    for key in ('require_complete', 'skip_event_records', 'save_plots', 'summarize', 'merge_replayfilter', 'defer_diagnostics'):
         if key in settings and type(settings[key]) is not bool:
             raise ValueError(f'{key} must be true or false')
+    if settings.get('defer_diagnostics') and not settings.get('merge_replayfilter'):
+        raise ValueError('defer_diagnostics requires merge_replayfilter: true')
     for key in ('state_dir', 'output_base', 'fs_install', 'workspace'):
         base = path.parent if key in supplied else common_path.parent
         settings[key] = path_value(settings[key], base)
@@ -125,9 +143,12 @@ def load(path, test=False):
         raise ValueError(f'{step} does not take executable options')
     settings['options'] = {**deepcopy(OPTIONS.get(step, {})), **settings['options']}
     if step == 'analysis':
-        if settings['analysis'].keys() - ANALYSIS.keys():
+        if settings['analysis'].keys() - (ANALYSIS.keys() | {'cross_section'}):
             raise ValueError('Unknown analysis setting; type, input, range and output are managed by the workflow')
         settings['analysis'] = {**deepcopy(ANALYSIS), **settings['analysis']}
+        # Leave an omitted mode implicit to preserve existing state signatures.
+        if settings['analysis'].get('cross_section', 'constant') not in ('constant', 'analytical', 'stored'):
+            raise ValueError('analysis.cross_section must be constant, analytical or stored')
         for key in ('tree_only', 'save_plots'):
             if type(settings['analysis'][key]) is not bool:
                 raise ValueError(f'analysis.{key} must be true or false')
@@ -148,4 +169,7 @@ def signature(settings):
     # Runtime resources and batch size can change without changing physics or inputs.
     excluded = {'config_file', 'workflow', 'n_jobs', 'require_complete',
                 'max_runtime', 'memory_mb', 'disk_mb', 'cpus', 'accounting_group'}
+    # Explicit per-master grouping remains compatible with existing state.
+    if settings.get('masters_per_job', 1) == 1:
+        excluded.add('masters_per_job')
     return {key: value for key, value in settings.items() if key not in excluded}

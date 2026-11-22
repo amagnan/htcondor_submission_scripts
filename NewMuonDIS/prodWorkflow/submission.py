@@ -4,11 +4,25 @@ import os
 from pathlib import Path
 import shlex
 import uuid
+import zlib
 
 from prodWorkflow.state import verify, write_json
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
+
+
+def disgen_seed(production, master, subjob):
+    """Pair Ganga IDs uniquely, then rotate within Pythia6's positive seed range."""
+    if any(type(value) is not int or value < 0 for value in (master, subjob)):
+        raise ValueError('Seed job IDs must be nonnegative integers')
+    limit = 899999999
+    pair = (master + subjob) * (master + subjob + 1) // 2 + subjob
+    if pair >= limit:
+        raise ValueError('Ganga job IDs exceed the collision-free disgen seed range')
+    production = str(production)
+    base = int(production) if production.isdecimal() else zlib.crc32(production.encode('utf-8'))
+    return (base + pair) % limit + 1
 
 
 def monitor(jobs):
@@ -41,6 +55,11 @@ def preview(state, groups, verbose=False):
           f'{sum(len(group["units"]) for group in groups)} executable ranges '
           f'({"test" if settings["test"] else "production"})')
     print(f'State: {state.path}')
+    if groups and settings['step'] == 'disgen' and '--seed' not in settings['options']:
+        print('Seeds: assigned from production + Ganga master/subjob IDs at submission; saved in task JSON.')
+        if verbose:
+            print('Interactive preview tasks have no Ganga ID: set options.--seed for a fixed preview seed, '
+                  'or use a submitted task JSON.')
     if not groups:
         print('No new eligible work selected; existing attempts are not submitted again.')
         if settings['test'] and state.data['attempts']:
@@ -57,7 +76,7 @@ def preview(state, groups, verbose=False):
                 print(f'    Entries [{spec["first"]}, {spec["first"] + spec["count"]}); config: {path}')
                 print('    Interactive (fresh directory each time):')
                 print('    (cd "$(mktemp -d /tmp/muondis-debug.XXXXXX)" && ' +
-                      shlex.join(['python3', '-u', str(ROOT / 'prodWorkflow/worker.py'), str(path)]) + ')')
+                      shlex.join(['python3', '-u', str(ROOT / 'worker.py'), str(path)]) + ')')
     if not verbose:
         print('Use --verbose for readable task files and interactive commands.')
 
@@ -81,21 +100,27 @@ def submit(state, groups, api):
         folder = Path(settings['step_dir']) / 'tasks' / attempt_id
         task_paths = []
         output_map = {}
+        job = api.Job(name=f'{settings["name"]} {settings["production"]} {group["id"]}')
         for index, unit in enumerate(group['units']):
             path = folder / f'task-{unit["id"]}.json'
-            write_json(path, unit['spec'])
+            spec = unit['spec']
+            if settings['step'] == 'disgen' and '--seed' not in settings['options']:
+                seed = disgen_seed(settings['production'], job.id, index)
+                spec = dict(spec, args=[*spec['args'], '--seed', str(seed)],
+                            random_seed=dict(value=seed, production=settings['production'],
+                                             master_job=job.id, subjob=index))
+            write_json(path, spec)
             task_paths.append(path)
             output_map[unit['id']] = [str(Path(outdir) / group['id'] / attempt_id / str(index) / name)
                                       for name in unit['spec']['outputs']]
         split = len(task_paths) > 1
-        job = api.Job(name=f'{settings["name"]} {settings["production"]} {group["id"]}')
-        job.application = api.Executable(exe=api.File(str(ROOT / 'prodWorkflow/worker.py')),
+        job.application = api.Executable(exe=api.File(str(ROOT / 'worker.py')),
                                          args=[] if split else [task_paths[0].name])
         if split:
             job.splitter = api.ArgSplitter(args=[[path.name] for path in task_paths], append=True)
         job.inputfiles = [str(path) for path in task_paths]
         job.inputfiles.extend(str(ROOT / name) for name in
-                              ('wn_script_pixi.py', 'replayfilter_worker.py', 'replayChain.py'))
+                              ('wn_script_pixi.py', 'replayfilter_worker.py', 'replayChain.py', 'replayDiagnostics.py'))
         # Each subjob produces its own range's files; do not require siblings' outputs.
         step = settings['step']
         pattern = ('analysis_evt*.tar.gz' if step == 'analysis' else

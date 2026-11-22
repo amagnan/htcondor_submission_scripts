@@ -3,15 +3,16 @@
 import json
 from pathlib import Path
 import re
+import shlex
 import tarfile
 
-import checkAnalysis
-import checkFilterOutputs
-import checkPrepareEventsOutputs as preparation
-import checkReplay
-import checkReplayFilter
-from jobTiming import print_job_timing, read_job_timing
+from prodWorkflow import checkAnalysis, checkFilterOutputs, checkReplay, checkReplayFilter
+from prodWorkflow import checkPrepareEventsOutputs as preparation
+from prodWorkflow import replayDiagnostics
+from prodWorkflow.jobTiming import print_job_timing, read_job_timing
 from prodWorkflow.state import fingerprint, timestamp, verify, write_json
+
+CHECK_VERSION = 2
 
 
 def local_path(value):
@@ -70,6 +71,8 @@ def inspect(settings, group, unit, attempt, full=False):
             raise ValueError('Analysis provenance/range differs from its task')
         artifact.update(entries=manifest['entries_processed'], analysis=result)
         stats = dict(processed=manifest['entries_processed'], normalization=manifest['normalization'])
+        if full:
+            stats.update(checkAnalysis.check_event_tree(result, spec['fs_install']))
     elif step == 'replayfilter':
         _, record = checkReplayFilter.read_checked_output(logfile, check_metadata=False)
         if record['production'] != spec['filter'] or record['filter']['events_processed'] != spec['count']:
@@ -91,8 +94,17 @@ def inspect(settings, group, unit, attempt, full=False):
         status, stats = checkReplay.parse_stdout(text)
         if stats is None:
             raise ValueError(status)
-        if stats['generated'] != spec['count'] or stats['first_event'] != spec['first']:
+        # -n selects prepared input muons; each can generate many DIS events.
+        # Validate the input selection against the recorded worker command,
+        # then validate the generated DIS count against cbmsim entries below.
+        commands = re.findall(r'^INFO: Executing: (.+)$', text, re.MULTILINE)
+        expected_command = [str(Path(spec['fs_install']) / spec['runfile']), *spec['args']]
+        if (len(commands) != 1
+                or shlex.split(commands[0])[-len(expected_command):] != expected_command
+                or stats['first_event'] != spec['first']):
             raise ValueError('Replay log range differs from its task')
+        if Path(stats['output']).name != spec['outputs'][0]:
+            raise ValueError('Replay log output differs from its task')
         artifact.update(replay_type=step, master=spec['sources'][0],
                         geometries=[next(path for path in files if Path(path).name.startswith('geo_'))])
     if step != 'analysis':
@@ -100,7 +112,8 @@ def inspect(settings, group, unit, attempt, full=False):
         if full and step == 'disgen':
             status, metadata = preparation.root_statistics(output, include_metadata=True)
         else:
-            status, metadata = preparation.root_statistics(output, metadata_only=True, tree_name=tree)
+            options = dict(replay_paths=True) if full and tree == 'cbmsim' else {}
+            status, metadata = preparation.root_statistics(output, metadata_only=True, tree_name=tree, **options)
         if metadata is None:
             raise ValueError(f'{output}: {status}')
         stats.update(metadata)
@@ -110,6 +123,8 @@ def inspect(settings, group, unit, attempt, full=False):
             raise ValueError('Filter ROOT entries differ from the selected count')
         if step == 'replayfilter' and metadata['written'] != stats['selected']:
             raise ValueError('Replayfilter ROOT entries differ from the selected count')
+        if step == 'replayfilter':
+            checkReplayFilter.validate_path_schema(record, metadata)
         if step.startswith('disreplay') and metadata['written'] != stats['generated']:
             raise ValueError('Replay ROOT entries differ from generated count')
     return dict(unit=unit['id'], attempt=attempt['id'], job_id=attempt['job_id'], subjob_id=child,
@@ -163,14 +178,17 @@ def print_summary(step, successful, metadata=False):
                 preparation.print_stats(f'DIS {material} {suffix}', values, width=36)
     if step.startswith('disreplay'):
         for collection in checkReplay.HIT_COLLECTIONS:
-            preparation.print_stats('Restored ' + collection,
-                                    [item['restored_hits'][collection] for item in results], width=36)
+            values = [item['restored_hits'][collection] for item in results
+                      if collection in item['restored_hits']]
+            if values:
+                preparation.print_stats('Restored ' + collection, values, width=36)
         real = sum(item['real_time'] for item in results)
         cpu = sum(item['cpu_time'] for item in results)
         print(f'Simulation CPU / real time: {100 * cpu / real:.2f}%' if real else 'Simulation CPU / real time: undefined')
     if step in ('disfilter', 'replayfilter'):
         before, after = (sum(item[key] for item in results) for key in ('processed', 'selected'))
         print(f'Selection efficiency: {after}/{before}' + (f' ({100 * after / before:.6g}%)' if before else ''))
+    replayDiagnostics.print_path_statistics(results)
     print_job_timing([item['timing'] for item in successful])
     if metadata:
         preparation.print_normalization_statistics(normalization_results(results))
@@ -182,7 +200,8 @@ def check(state, metadata=False, full=False, refresh=False):
     previous = json.loads(previous_path.read_text()) if previous_path.exists() else None
     if previous and previous.get('state_id') != state.data['id']:
         previous = None
-    cached = {item['unit']: item for item in previous['successful']} if previous else {}
+    cached = ({item['unit']: item for item in previous['successful']}
+              if previous and previous.get('check_version') == CHECK_VERSION else {})
     successful, problems, records = [], [], []
     for group in state.data['groups']:
         group_results = []
@@ -236,7 +255,7 @@ def check(state, metadata=False, full=False, refresh=False):
             if identity in identities and identities[identity] != record:
                 raise ValueError(f'Conflicting preparation metadata: {identity}')
             identities[identity] = record
-    report = dict(version=1, state_id=state.data['id'], revision=state.data['revision'],
+    report = dict(version=1, check_version=CHECK_VERSION, state_id=state.data['id'], revision=state.data['revision'],
                   step=settings['step'], test=settings['test'], checked=timestamp(),
                   complete=bool(state.data['groups']) and not problems,
                   records=records, successful=successful, problems=problems)

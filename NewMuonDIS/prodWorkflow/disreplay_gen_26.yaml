@@ -1,7 +1,9 @@
 # Replay checker-approved disgen files; use saved ROOT entry counts for splitting.
 step: disreplay_gen
 # upstream: disgen
-events_per_subjob: 500        # Example size; default null (one range).
+n_jobs: 200                   # Maximum new disgen subjob outputs to replay per invocation; -1 = all.
+events_per_subjob: 1000        # Example size; default null (one range).
+require_complete: false        # Wait for every upstream range; false explicitly accepts successful inputs only.
 options:
   --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_50cm_before_end_MS/geo_38e81e44-f930-4da3-8c80-dfa3b693a616.root
   --shieldName: null           # Suppress workflow default TRY_2026 when using --geofile.
@@ -20,11 +22,9 @@ options:
 # Less commonly changed workflow settings (defaults shown).
 workflow: workflow_26.yaml       # Relative to this file.
 # name: STEP                   # Default: the step value; use a new name for a new selection.
-# require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
-# n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
 # Resource overrides inherit workflow.yaml; its defaults are:
 # max_runtime: 86000            # Seconds.
-# memory_mb: 3000
+memory_mb: 6000
 # disk_mb: 50000                # Requested worker disk; site limits still apply.
 # cpus: 1
 # accounting_group: group_u_SHIP.u_ship_cg

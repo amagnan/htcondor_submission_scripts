@@ -3,6 +3,11 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 for argument in "$@"; do
     case "$argument" in
+        --checkInputs) exec python3 -B "$script_dir/checkInputs.py" "$@" ;;
+    esac
+done
+for argument in "$@"; do
+    case "$argument" in
         -h|--help) exec python3 "$script_dir/workflow.py" "$@" ;;
     esac
 done
