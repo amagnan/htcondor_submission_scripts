@@ -5,7 +5,7 @@ n_jobs: 200                   # Maximum new disgen subjob outputs to replay per 
 events_per_subjob: 1000        # Example size; default null (one range).
 require_complete: false        # Wait for every upstream range; false explicitly accepts successful inputs only.
 options:
-  --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_50cm_before_end_MS/geo_38e81e44-f930-4da3-8c80-dfa3b693a616.root
+  # --materials: [HE, HeBalloon]  # Example subset; omit to replay all stored categories.
   --shieldName: null           # Suppress workflow default TRY_2026 when using --geofile.
   --strawDesign: null          # Suppress workflow default 10 when using --geofile.
   --noSND: false               # Suppress workflow default true when using --geofile.

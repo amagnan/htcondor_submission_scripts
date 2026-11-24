@@ -62,6 +62,11 @@ class State:
             # Do not migrate the saved signature or relax submission/retry checks.
             if inspect_existing and settings['step'] == 'replayfilter' and 'diagnostics' not in saved:
                 configuration.pop('diagnostics', None)
+            if inspect_existing and settings['step'] == 'analysis' and saved.get('analysis', {}).get('geometry_file') is None:
+                # Existing tasks used each checked companion geometry. Let checks
+                # inspect them without changing the geometry for new submissions.
+                configuration['analysis'] = dict(configuration['analysis'])
+                configuration['analysis']['geometry_file'] = None
             if self.data.get('version') != 1 or saved != configuration:
                 raise ValueError(f'Settings differ from {self.path}; use the original YAML, rerun, or a new production/name')
         else:

@@ -18,11 +18,11 @@ COMMON = dict(production='new_production', tag='TRY2026', state_dir='.state',
               fs_install='/afs/cern.ch/work/a/ammagnan/FairShip-cvmfs',
               workspace=f'~/gangadir/workspace/{getpass.getuser()}/LocalXML',
               max_runtime=86000, memory_mb=3000, disk_mb=50000, cpus=1,
-              accounting_group='group_u_SHIP.u_ship_cg')
+              accounting_group='group_u_SHIP.u_ship_cg', geometry_file=None)
 DEFAULTS = dict(name=None, upstream=None, require_complete=True, n_jobs=-1,
                 first_event=0, events_per_file=-1, events_per_subjob=None,
                 n_subjobs=None, masters_per_job=1, input_dir=None, input_pattern='*sim_*.root',
-                geometry_file=None, options={}, analysis={},
+                options={}, analysis={},
                 skip_event_records=True, save_plots=True, merge_output=None,
                 unpack_dir=None)
 EXECUTABLES = {'disgen': 'newMuonDIS/prepareEvents.py',
@@ -80,7 +80,7 @@ def load(path, test=False):
             raise ValueError('Top-level cross_section applies only to replayfilter; use analysis.cross_section for analysis')
         if supplied['cross_section'] not in ('stored', 'analytical'):
             raise ValueError('replayfilter cross_section must be stored or analytical')
-    only = {'input_pattern': ('disgen',), 'geometry_file': ('replayfilter',),
+    only = {'input_pattern': ('disgen',),
             'masters_per_job': ('analysis',),
             'skip_event_records': ('merger',), 'save_plots': ('merger',), 'summarize': ('merger',),
             'merge_output': ('merger',), 'unpack_dir': ('merger',), 'merge_replayfilter': ('merger',),
@@ -130,7 +130,10 @@ def load(path, test=False):
     for key in ('state_dir', 'output_base', 'fs_install', 'workspace'):
         base = path.parent if key in supplied else common_path.parent
         settings[key] = path_value(settings[key], base)
-    for key in ('input_dir', 'geometry_file', 'merge_output', 'unpack_dir'):
+    if settings['geometry_file'] is not None:
+        base = path.parent if 'geometry_file' in supplied else common_path.parent
+        settings['geometry_file'] = path_value(settings['geometry_file'], base)
+    for key in ('input_dir', 'merge_output', 'unpack_dir'):
         if settings[key] is not None:
             settings[key] = path_value(settings[key], path.parent)
     if step == 'disgen' and (not settings['input_dir'] or settings['events_per_file'] == -1):
@@ -142,10 +145,18 @@ def load(path, test=False):
     if step not in OPTIONS and settings['options']:
         raise ValueError(f'{step} does not take executable options')
     settings['options'] = {**deepcopy(OPTIONS.get(step, {})), **settings['options']}
+    if step in ('disgen', 'disfilter', 'disreplay_gen', 'disreplay_filter'):
+        flag = '--geoFile' if step in ('disgen', 'disfilter') else '--geofile'
+        if flag in settings['options']:
+            raise ValueError(f'Use geometry_file instead of options.{flag}')
+        if settings['geometry_file']:
+            settings['options'][flag] = settings['geometry_file']
     if step == 'analysis':
         if settings['analysis'].keys() - (ANALYSIS.keys() | {'cross_section'}):
             raise ValueError('Unknown analysis setting; type, input, range and output are managed by the workflow')
         settings['analysis'] = {**deepcopy(ANALYSIS), **settings['analysis']}
+        if settings['analysis']['geometry_file'] is None:
+            settings['analysis']['geometry_file'] = settings['geometry_file']
         # Leave an omitted mode implicit to preserve existing state signatures.
         if settings['analysis'].get('cross_section', 'constant') not in ('constant', 'analytical', 'stored'):
             raise ValueError('analysis.cross_section must be constant, analytical or stored')
@@ -172,4 +183,9 @@ def signature(settings):
     # Explicit per-master grouping remains compatible with existing state.
     if settings.get('masters_per_job', 1) == 1:
         excluded.add('masters_per_job')
-    return {key: value for key, value in settings.items() if key not in excluded}
+    result = {key: value for key, value in settings.items() if key not in excluded}
+    if settings['step'] != 'replayfilter':
+        # Other stages record the effective geometry in options or analysis;
+        # merger only consumes geometries already checked in upstream files.
+        result['geometry_file'] = None
+    return result

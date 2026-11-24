@@ -12,7 +12,7 @@ from prodWorkflow import replayDiagnostics
 from prodWorkflow.jobTiming import print_job_timing, read_job_timing
 from prodWorkflow.state import fingerprint, timestamp, verify, write_json
 
-CHECK_VERSION = 2
+CHECK_VERSION = 3
 
 
 def local_path(value):
@@ -155,7 +155,7 @@ def print_summary(step, successful, metadata=False):
     keys = {
         'disgen': [('processed', 'Input entries processed'), ('written', 'MuonDIS entries written'),
                    ('mu_plus', 'Muons mu+'), ('mu_minus', 'Muons mu-'),
-                   ('skipped_events', 'Skipped malformed/non-muon'), ('skipped_low_p', 'Skipped low-p muons'),
+                   ('skipped_events', 'Skipped events incl. invalid paths'), ('skipped_low_p', 'Skipped low-p muons'),
                    ('no_hits', 'Counted no detector hits'), ('weighted_muons', 'Muons written weighted')],
         'disfilter': [('processed', 'Muon entries processed'), ('selected', 'Muon entries selected'), ('skipped', 'Muon entries skipped')],
         'replayfilter': [('processed', 'Replay events processed'), ('two_tracks', 'Events with >=2 tracks'),

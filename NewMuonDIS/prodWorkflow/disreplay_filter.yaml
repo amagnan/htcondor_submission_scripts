@@ -3,7 +3,7 @@ step: disreplay_filter
 # upstream: disfilter
 events_per_subjob: 1000        # Example size; default null (one range).
 options:
-  --geofile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
+  # --materials: [HE, HeBalloon]  # Example subset; omit to replay all stored categories.
   --shieldName: null           # Suppress workflow default TRY_2026 when using --geofile.
   --strawDesign: null          # Suppress workflow default 10 when using --geofile.
   --noSND: false               # Suppress workflow default true when using --geofile.

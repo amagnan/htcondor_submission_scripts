@@ -5,8 +5,6 @@ diagnostics: true             # Save per-source selection diagnostics and plots.
 upstream: disreplay_gen        # Use disreplay_filter for the optional branch.
 n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
 require_complete: false        # Wait for every upstream range; false explicitly accepts successful inputs only.
-geometry_file: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS_261111/geo_0b051241-9013-4c3f-98dc-36ac379147f9.root
-#geometry_file: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS/geo_00225854-9b0d-4e5d-bff9-11ca5f530b31.root
 # No splitting/range options: one whole replay master per job.
 # To run both branches, copy this YAML and set name: replayfilter_filter,
 # upstream: disreplay_filter, then use that name as analysis.upstream.

@@ -1,16 +1,15 @@
 # First stage: the ONLY stage that discovers input files.
 step: disgen
-input_dir: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS_261111/
+input_dir: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS_support_only/
 #/eos/experiment/ship/simulation/cuda_muons/try_2026_MS5
 events_per_file: 250000        # Required for disgen; maximum input entries per file.
-events_per_subjob: 25000      # Example: ten subjobs per full file; default null.
+events_per_subjob: 250000      # Example: ten subjobs per full file; default null.
 n_jobs: -1                   # Maximum new Ganga masters per invocation; -1 = all.
 require_complete: true        # Wait for every upstream range; false explicitly accepts successful inputs only.
 options:
-  --geoFile: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_2018_muons_50cm_before_end_MS_261111/geo_0b051241-9013-4c3f-98dc-36ac379147f9.root
-#/eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
-  --nDIS: 100                 # Workflow default 100 (executable default 1000).
-  --z_min: 2000               # Workflow default 2000 cm (executable default 2500).
+  --materials: [SBTss]  # Default: all except REST.
+  --nDIS: 5000                 # Workflow default 100 (executable default 1000).
+  --z_min: 3000               # Workflow default 2000 cm (executable default 2500).
   --z_max: 9500               # Workflow default 9500 cm (executable default 20000).
   # --seed: 12345             # Omit for automatic production/job seed; null opts into time-based seeding.
   # --debug: 0
@@ -38,4 +37,3 @@ workflow: workflow.yaml       # Relative to this file.
 # output_base: /eos/experiment/ship/user/ammagnan/MuonDIS
 # tag: TRY2026
 # production: new_production
-

@@ -2,7 +2,6 @@
 step: disfilter
 # upstream: disgen
 options:
-  --geoFile: /eos/experiment/ship/simulation/cuda_muons/try_2026_MS5/geofile_2609.root
   --filter-option: 1           # Workflow default 1 (executable default 0).
   --pythia-decays: true        # Workflow default true (executable default false).
   # --pythia-decay-seed: 0    # 0 = time-based; set a fixed positive value for reproducibility.

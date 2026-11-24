@@ -98,6 +98,43 @@ def parse_extra_diagnostics(text):
         rf'Muons with large POCA transverse jumps \(sum MCTrack\[0\]\.fW\): (?P<large_jumps>{NUMBER})',
     )
     result = {}
+    if 'Input muon multiplicity:' in text or 'Companion muons' in text:
+        multiplicity = re.findall(
+            rf'Input muon multiplicity: (\d+) events with n_mu >= ([12]), '
+            rf'sum\(n_mu\) = (\d+), average n_mu = ({NUMBER})', text)
+        companions = re.findall(
+            r'Companion muons \(excluding the selected DIS muon\): (\d+) '
+            r'in (\d+) events with n_mu >= 2', text)
+        if len(multiplicity) != 1:
+            raise ValueError('missing or ambiguous input muon multiplicity/companion counts')
+        events, minimum, muons = map(int, multiplicity[0][:3])
+        average = float(multiplicity[0][3])
+        if minimum == 1:
+            if len(companions) != 1:
+                raise ValueError('missing or ambiguous input muon multiplicity/companion counts')
+            count, multi_events = map(int, companions[0])
+        else:
+            if 'Companion muons' in text:
+                raise ValueError('ambiguous legacy input muon multiplicity/companion counts')
+            count, multi_events = muons - events, events
+        if (muons < minimum * events or count != muons - events or multi_events > min(events, count)
+                or bool(count) != bool(multi_events) or (not events and muons)
+                or not math.isfinite(average)
+                or not math.isclose(average, muons / events if events else 0., rel_tol=1e-5)):
+            raise ValueError('inconsistent input muon multiplicity/companion counts')
+        result['input_multiplicity'] = dict(companions=count, multi_events=multi_events)
+        if minimum == 1:
+            result['input_multiplicity'].update(events=events, muons=muons)
+        else:
+            result['input_multiplicity']['multi_muons'] = muons
+    if 'Discarded muons with no DIS' in text:
+        discarded = re.findall(
+            rf'Discarded muons with no DIS in selected materials: (\d+), '
+            rf'sum\(fW\) = ({NUMBER})', text)
+        if len(discarded) != 1 or not math.isfinite(float(discarded[0][1])):
+            raise ValueError('missing, ambiguous or invalid discarded-muon counts')
+        result['discarded_no_dis'] = int(discarded[0][0])
+        result['discarded_no_dis_weight'] = float(discarded[0][1])
     if '(sum MCTrack[0].fW)' in text:
         weighted = {}
         for pattern in patterns:
@@ -111,9 +148,9 @@ def parse_extra_diagnostics(text):
     if 'Muon path totals' in text:
         totals = {}
         for material in ('ALL', *MATERIALS):
-            prefix = (r'\(cm, excluding REST\): output' if material == 'ALL'
-                      else re.escape(material) + r' \(cm\): crossing')
-            pattern = (rf'Muon path totals {prefix} muons = (?P<muons>\d+), '
+            prefix = (r'\(cm, excluding REST\): (?:output muons|muons with valid paths)' if material == 'ALL'
+                      else re.escape(material) + r' \(cm\): crossing muons')
+            pattern = (rf'Muon path totals {prefix} = (?P<muons>\d+), '
                        rf'sum\(fW\) = (?P<weight>{NUMBER}), sum\(L\) = (?P<length>{NUMBER}), '
                        rf'sum\(fW\*L\) = (?P<weighted_length>{NUMBER})')
             matches = list(re.finditer(pattern, text))
@@ -187,6 +224,28 @@ def require_preparation_metadata(metadata):
 
 
 def print_extra_statistics(results):
+    multiplicity = [result['input_multiplicity'] for result in results if 'input_multiplicity' in result]
+    print(f'\nInput muon multiplicity: {len(multiplicity)}/{len(results)} subjobs reporting; before selection.')
+    if multiplicity:
+        for key, label in (('companions', 'Companion muons (input)'), ('multi_events', 'Input events with >=2 muons')):
+            print_stats(label, [item[key] for item in multiplicity], width=36)
+        print('Companions exclude one selected DIS muon per input event; counts are before momentum/path/DIS cuts.')
+    inclusive = [item for item in multiplicity if 'events' in item]
+    if inclusive:
+        print(f'Inclusive input multiplicity: {len(inclusive)}/{len(results)} subjobs reporting.')
+        for key, label in (('events', 'Input events with >=1 muon'), ('muons', 'Input muons incl. companions')):
+            print_stats(label, [item[key] for item in inclusive], width=36)
+        events = sum(item['events'] for item in inclusive)
+        muons = sum(item['muons'] for item in inclusive)
+        print('Average input muons/event (combined totals): '
+              + (f'{muons / events:.8g}' if events else 'undefined'))
+    if len(multiplicity) < len(results):
+        print('Companion counts unavailable for logs without multiplicity diagnostics; missing counts are not zero.')
+    discarded = [result for result in results if 'discarded_no_dis' in result]
+    if discarded:
+        print(f'\nNo DIS in selected materials: {len(discarded)}/{len(results)} subjobs reporting.')
+        print_stats('Discarded muons: no DIS', [item['discarded_no_dis'] for item in discarded], width=36)
+        print_stats('Discarded no DIS weighted', [item['discarded_no_dis_weight'] for item in discarded], width=36)
     weighted = [result['weighted_diagnostics'] for result in results if 'weighted_diagnostics' in result]
     if weighted:
         print(f'\nWeighted diagnostics: {len(weighted)}/{len(results)} subjobs; sum MCTrack[0].fW (no DIS scaling).')
@@ -604,7 +663,7 @@ def main():
                            ('written', 'MuonDIS entries written'),
                            ('weighted_muons', 'Muons written weighted'),
                            ('mu_plus', 'Muons mu+'), ('mu_minus', 'Muons mu-'),
-                           ('skipped_events', 'Skipped malformed/non-muon'),
+                           ('skipped_events', 'Skipped events incl. invalid paths'),
                            ('skipped_low_p', 'Skipped low-p muons'),
                            ('no_hits', 'Counted no detector hits')):
             if (key == 'weighted_muons' and not args.check_root) or (key == 'written' and not (args.check_root or args.metadata)):

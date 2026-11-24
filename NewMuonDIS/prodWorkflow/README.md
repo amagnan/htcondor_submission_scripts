@@ -19,6 +19,12 @@ The local disgen checker accepts both the older UBT diagnostics and the newer
 UBT scoring-plane/shield-exit wording, including weighted diagnostics. It keeps
 backward-path statistics for the two origins separate and still rejects missing
 or duplicate diagnostic blocks.
+The summary also reports input companion muons and events with at least two
+muons, before momentum/path/DIS selection. For older multiplicity logs, companion
+counts are `sum(n_mu) - events with n_mu >= 2`; newer logs provide them directly.
+Logs without either counter are reported as unavailable, not zero. Newer logs
+also supply inclusive input multiplicity and counts discarded for having no DIS
+in the selected materials. Multiplicity averages use combined totals.
 
 ```mermaid
 flowchart TD
@@ -44,14 +50,28 @@ they run. Changing files after checking requires a fresh check.
 
 ## Start a campaign
 
-Edit `workflow.yaml` first: choose a new `production` name, output location and
-FairShip installation. The examples contain the current geometry/map paths;
-review them for the new production. Relative paths resolve beside their YAML,
+Edit `workflow.yaml` first: choose a new `production` name, output location,
+FairShip installation and `geometry_file`. The shared geometry is passed as
+`--geoFile` to disgen/disfilter, `--geofile` to disreplay, and as the geometry
+override to replayfilter and analysis. Merger inherits the setting but publishes
+the checked replayfilter companion geometry to preserve its input provenance.
+Set `geometry_file` in an individual stage YAML only for a deliberate override;
+do not put geometry flags in `options`. Review map paths for the new production.
+Relative paths resolve beside their YAML,
 not against the shell's working directory. Common values can be overridden in
 a stage YAML. Commented settings show defaults; active values are examples or
 the settings most likely to change. `options` accepts the corresponding
 FairShip executable's physics flags; `null`/`false` suppress a flag, while a list
 provides multiple arguments. Input, output and range flags are reserved.
+
+Select DIS categories with `options.--materials`, using a YAML list such as
+`--materials: [HE, HeBalloon]`. Uncomment and edit the examples in the `disgen`
+and `disreplay_gen`/`disreplay_filter` YAMLs to choose a subset. Valid categories
+are `MS`, `UBT`, `SBTsens`, `SBTfr`, `SSTsens`, `SSTfr`, `HE`, `AIR`, `HeBalloon`,
+`REST` and `SBTss`. With the option omitted (or `null`), generation uses all
+categories except `REST`, while replay uses all stored categories. Replay can
+select a subset of the generated interactions; it cannot add missing ones.
+Replayfilter and analysis use the stored interactions and need no materials option.
 
 New `disgen` submissions default to a reproducible seed derived from `production`
 in the shared workflow YAML and the Ganga master/subjob IDs. For numeric
@@ -409,8 +429,9 @@ bundle is built and retained locally at
 
 - `replayfilter_merged.root`: one `cbmsim` tree with all original branches,
   including stored analytical `muDIS_xsec` and original MCTrack weights.
-- `geo_replayfilter_merged.root`: the matching geometry, after comparing the
-  persisted geometry objects across all inputs.
+- `geo_replayfilter_merged.root`: a copy of the first planned input's geometry.
+  Only this geometry is loaded; all inputs are assumed to share the geometry
+  configured for replay filtering.
 - `replayfilter_merged.json`: input identities, entry offsets, aggregate filter
   counts, deduplicated normalization and output sizes/SHA-256 checksums.
 
@@ -439,15 +460,33 @@ For another campaign or upstream, copy its merger YAML, choose a new `name`,
 and add `defer_diagnostics: true` with `merge_replayfilter: true`.
 Keep the same YAML for both passes. Existing YAMLs retain the combined behaviour.
 Changing an interrupted merger's saved settings requires a new step name;
-the existing `merged/` publication directory must still be absent. A new name
-does not permit overwriting a previously published bundle.
+the existing `merged/` publication directory must still be absent or empty. A new name
+does not permit overwriting a previously published bundle. An empty publication
+directory is allowed, including one left after removing an old bundle's files;
+retrying a failed transfer reuses the completed local merge.
+For `/eos/experiment` outputs, uploads use `xrdcp --posc --cksum adler32`
+against `eospublic.cern.ch`, so each transfer must close successfully and
+pass checksum verification. The staging bundle is verified through XRootD
+before the final directory rename with `xrdfs`. Publication checks the server's final filenames and
+manifest, then streams the published files through XRootD to verify their
+sizes and SHA-256 checksums without storing another local copy. Each file
+read attempt is bounded to ten minutes. EOS's `[3007] wrong file checksum`
+read error is retried twice, after 5 and 15 seconds; a complete size and
+SHA-256 match is still required. Persistent errors retain the local bundle.
+Destination checks, uploads, verification,
+and saved publication identities use the server directly: they do not depend
+on the EOS mount exposing the renamed paths. If verification fails, the
+completed local bundle remains available for retry. Existing publications
+are verified and reused without copying them again.
 
-The baseline pass still copies `cbmsim` with ROOT's fast basket merge, checks
-geometry, and retains normalization, filter counts and original provenance.
+The baseline pass still copies `cbmsim` with ROOT's fast basket merge, loads
+the first input's geometry, and retains normalization, filter counts and original provenance.
 It skips the diagnostic trees and histograms, marking `diagnostics_deferred`
 in its ROOT/JSON metadata. This removes the diagnostic pass over **all
 processed replay events**, including rejected events, from the baseline merge.
-Geometry checks, metadata copying, checksums and transfer still take time.
+Other geometry files receive only the existing file identity/size checks;
+their ROOT contents are not opened or compared. Metadata copying, checksums
+and transfer still take time.
 The analysis summary is independent and still runs when `summarize: true`;
 set it to `false` in the new YAML before the first run to defer that work too
 (see the standalone summary command below).
@@ -463,6 +502,45 @@ without changing the baseline bundle or rerunning analysis. Keep the original
 filtered inputs until this pass completes. Transfer failures can reuse the
 completed local diagnostic bundle on retry; interrupted builds restart.
 
+For limited local/AFS quota, use split publication:
+
+```bash
+./gangaSubmit.sh merge-diagnostics merger_fast.yaml --split --submit
+```
+
+This first builds histograms only, without scanning diagnostic tree rows, and
+publishes them under `merged_diagnostics/histograms/`. It then builds the two
+diagnostic trees in parts under `merged_diagnostics/trees_0000/`, `trees_0001/`,
+and so on. Each directory contains `replayfilter_diagnostics.root` and its JSON
+manifest. Within the ROOT files the objects retain their `diagnostics/` paths.
+Only after a part is verified on EOS is its local bundle removed, before the
+next part starts. Local plan files and workflow state remain for recovery.
+Retries reuse published parts; a failed transfer retains its completed local
+part, and a failed build restarts only that part. The completed baseline and
+an earlier failed unsplit diagnostic attempt need no changes.
+
+Tree parts group consecutive whole input files using at most **4 GiB of
+compressed input ROOT files** per part by default. Set `--tree-part-gib 2` for
+smaller parts, retaining the same value on retries. This is a sizing guide,
+not a strict output-size limit; merged compression can differ. A single input
+larger than the limit is rejected before building. Splitting off histograms
+alone does not bound tree size, so tree partitioning is also necessary.
+Histogram bins and errors are summed across all inputs, efficiencies are
+recomputed, and tree `selected_entry` offsets remain relative to the full
+baseline `cbmsim`. To read all event diagnostic rows as one tree:
+
+```python
+from pathlib import Path
+
+chain = ROOT.TChain('diagnostics/replayFilterDiagnostics')
+directory = Path('/eos/experiment/ship/user/ammagnan/MuonDIS/TRY2026_2018/261112/production/replayfilter/merged_diagnostics')
+for path in sorted(directory.glob('trees_*/replayfilter_diagnostics.root')):
+    chain.Add(str(path))
+```
+
+Use `diagnostics/replayFilterMuons` similarly for muon rows. Without `--split`,
+the existing single-file diagnostic merge remains available.
+
 Both diagnostic merge modes use native C++ loops for reading, validating and
 writing scalar rows, updating selected-event offsets, and checking histogram
 bin counts. ROOT compiles `replayMergeDiagnostics.hxx` once per process; no
@@ -472,7 +550,15 @@ schemas, histogram combinations and publication. Progress is printed every
 
 `cbmsim` user information contains one `muDIS_normalization` collection, with
 preparation and replay records deduplicated by stable ID. Conflicting records,
-including extra fields, are rejected. `provenance/INPUT/` retains original
+including extra fields, are rejected. Other non-diagnostic tree user information
+and top-level simulation metadata are copied from the first planned input,
+including `cbmroot`, `BranchList`, `TimeBasedBranchList`, `FileHeader`,
+`MuDISGenerator_postProcessing` and `FileSummary` when present. This applies
+to both the fast and combined merges. `FileHeader` and `FileSummary` retain
+that input's values; they are not aggregate run IDs or normalization totals.
+The `replayFilter.top_level_metadata` record identifies this policy and its
+source. Use `replayFilter` counts and `muDIS_normalization` for merged totals.
+`provenance/INPUT/` retains original
 worker manifests, tree user information, configuration and auxiliary objects;
 merged diagnostic trees/histograms are stored once under `diagnostics/`.
 The top-level `replayFilter` record contains aggregate counts and source-to-output

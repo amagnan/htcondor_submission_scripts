@@ -9,7 +9,7 @@ analysis:
   target_sum_weights: 3.5369771e+09    # null = no target scaling; set the full-production muon weight sum.
 # failed_job_factor: 1.0
   # save_plots: false         # Render once at merge time.
-  # geometry_file: null       # Checked companion geometry; an absolute override is supported.
+  # geometry_file: null       # Defaults to workflow_26.yaml geometry_file.
   # plot_axes:                # [minimum_cm, maximum_cm, number_of_bin_edges].
   #   x: [-500, 500, 500]
   #   y: [-500, 500, 500]

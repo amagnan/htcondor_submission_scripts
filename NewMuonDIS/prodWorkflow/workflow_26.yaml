@@ -6,6 +6,7 @@ production: 261105
 tag: TRY2026_2026
 output_base: /eos/experiment/ship/user/ammagnan/MuonDIS
 fs_install: /afs/cern.ch/work/a/ammagnan/FairShip-cvmfs
+geometry_file: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_50cm_before_end_MS/geo_38e81e44-f930-4da3-8c80-dfa3b693a616.root
 
 # Less commonly changed defaults (all supported shared settings).
 # state_dir: .state

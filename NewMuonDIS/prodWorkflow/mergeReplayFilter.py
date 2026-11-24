@@ -80,12 +80,15 @@ def normalization_tree(root, normalization):
 class Diagnostics:
     """Combine scalar trees and count histograms; derive efficiencies after summing."""
 
-    def __init__(self, root, directory):
+    def __init__(self, root, directory, component='all'):
+        if component not in ('all', 'trees', 'histograms'):
+            raise ValueError(f'Unknown diagnostic component: {component}')
         self.root, self.directory = root, directory
+        self.component = component
         self.native = native_diagnostics(root)
         self.writers, self.schemas, self.histograms, self.histogram_sets = {}, {}, {}, {}
         self.definition = None
-        self.rows = dict.fromkeys(DIAGNOSTIC_KEYS[:2], 0)
+        self.rows = dict.fromkeys(DIAGNOSTIC_KEYS[:2] if component != 'histograms' else (), 0)
 
     def writer(self, name, tree):
         schema = tree_schema(tree)
@@ -101,7 +104,7 @@ class Diagnostics:
         if definition.get('version') != 1 or (self.definition is not None and definition != self.definition):
             raise ValueError('Incompatible replayfilter diagnostic definitions')
         self.definition = definition
-        for name in DIAGNOSTIC_KEYS[:2]:
+        for name in self.rows:
             tree = source.Get(name)
             writer = self.writer(name, tree)
             entries = int(tree.GetEntries())
@@ -110,6 +113,8 @@ class Diagnostics:
                                                record['source_entry_start'], file_offset, selected_start,
                                                record['events_processed'], record['events_selected'],
                                                record['events_two_tracks']))
+        if self.component == 'trees':
+            return
         plots = source.GetDirectory('replayFilterPlots')
         if not plots:
             raise ValueError('Missing replayfilter diagnostic histograms')
@@ -160,7 +165,7 @@ class Diagnostics:
         self.directory.cd()
         for writer in self.writers.values():
             native_call(self.root, writer.write)
-        plots = self.directory.mkdir('replayFilterPlots')
+        plots = self.directory.mkdir('replayFilterPlots') if self.component != 'trees' else None
         for material, names in sorted(self.histogram_sets.items()):
             plots.mkdir(material).cd()
             for name in sorted(names):
@@ -201,8 +206,8 @@ def merge(root, plan, local):
     inputs = plan['inputs']
     if not inputs or len({item['path'] for item in inputs}) != len(inputs):
         raise ValueError('Replayfilter merge requires distinct input files')
-    records, schemas, uuids, geometries = [], [], set(), set()
-    geometry_signature, expected_entries = None, 0
+    records, schemas, uuids = [], [], set()
+    expected_entries = 0
     for item in inputs:
         verify(item['files'])
         record = read_filter_manifest(item['manifest'])
@@ -229,18 +234,15 @@ def merge(root, plan, local):
                 raise ValueError('ROOT replayFilter metadata differs from worker manifest')
             if any(('diagnostics' in origin) != plan['diagnostics'] for origin in record['filter']['sources']):
                 raise ValueError('Replayfilter diagnostic availability differs from plan')
-        if item['geometry'] not in geometries:
-            geometry = Geometry(root, item['geometry'])
-            geometry.load(Path(item['path']))
-            current = serialized(root, geometry.manager)
-            if geometry_signature is not None and current != geometry_signature:
-                raise ValueError('Replayfilter geometries differ')
-            geometry_signature = current
-            geometries.add(item['geometry'])
         records.append((Path(item['manifest']), record))
     complete_masters(records)
     if expected_entries != plan['entries']:
         raise ValueError('Merged entry count differs from plan')
+    # Replayfilter inputs share the configured geometry; load only the copy
+    # that will be published alongside the merged events.
+    print('Loading shared geometry from the first replayfilter input', flush=True)
+    geometry = Geometry(root, inputs[0]['geometry'])
+    geometry.load(Path(inputs[0]['path']))
     paths = [Path(item['path']) for item in inputs]
     normalization, usable = read_normalization(root, paths, 'cbmsim')
     if usable != paths or not normalization['preparation_complete']:
@@ -269,6 +271,21 @@ def merge(root, plan, local):
             info = selected.GetUserInfo()
             for item in list(info):
                 info.Remove(item)
+            # Match replayChain: expose the first input's ordinary simulation
+            # metadata at the top level, retaining all originals in provenance.
+            metadata_skip = ('cbmsim', 'replayFilter', 'replay_sources', 'provenance',
+                             'diagnostics', *DIAGNOSTIC_KEYS)
+            _copy_metadata(template, destination, skip=metadata_skip)
+            summary['top_level_metadata'] = dict(
+                policy='first input; original per-input values, not merged totals',
+                input=0, provenance='provenance/0',
+                keys=list(dict.fromkeys(key.GetName() for key in template.GetListOfKeys()
+                                        if key.GetName() not in metadata_skip)))
+            for item in template.Get('cbmsim').GetUserInfo():
+                if item.GetName() not in ('muDIS_normalization', 'diagnostics', *DIAGNOSTIC_KEYS):
+                    clone = item.Clone()
+                    root.SetOwnership(clone, False)
+                    info.Add(clone)
             merged_normalization = normalization_tree(root, normalization)
             normalization_records = {}
             provenance = destination.mkdir('provenance')
@@ -361,12 +378,15 @@ def merge_diagnostics(root, plan, local):
     local.parent.mkdir(parents=True, exist_ok=True)
     summary = dict(version=1, kind=plan['kind'], plan_id=plan['id'],
                    baseline_plan_id=plan['baseline_plan_id'], entries=plan['entries'])
+    component = plan.get('diagnostic_component', 'all')
+    if component != 'all':
+        summary.update(diagnostic_component=component, diagnostic_part=plan['diagnostic_part'])
     with tempfile.TemporaryDirectory(prefix='.replayfilter-diagnostics-', dir=local.parent) as temporary:
         folder = Path(temporary)
         output = folder / DIAGNOSTICS_NAME
         root.TTree.SetMaxTreeSize(1 << 60)
         with root.TFile.Open(str(output), 'RECREATE') as destination:
-            diagnostic = Diagnostics(root, destination.mkdir('diagnostics'))
+            diagnostic = Diagnostics(root, destination.mkdir('diagnostics'), component)
             for index, item in enumerate(plan['inputs']):
                 print(f'Combining diagnostics {index + 1}/{len(plan["inputs"])}', flush=True)
                 verify(item['files'])

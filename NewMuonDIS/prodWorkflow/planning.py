@@ -40,7 +40,7 @@ def ranges(settings, entries):
     requested = settings['events_per_file']
     count = available if requested == -1 else min(available, requested)
     if settings['test']:
-        count = min(count, 2 if settings['step'].startswith('disreplay') else 100)
+        count = min(count, 2 if settings['step'].startswith('disreplay') else 1000)
         return [(first, count)]
     size = settings['events_per_subjob']
     pieces = settings['n_subjobs']

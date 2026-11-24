@@ -148,6 +148,34 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotEqual(normal['step_dir'], test['step_dir'])
             self.assertNotEqual(normal['output_dir'], test['output_dir'])
 
+    def test_shared_geometry_reaches_each_stage(self):
+        geometry = str(self.base / 'shared.root')
+        common = dict(self.common, geometry_file=geometry)
+        (self.base / 'workflow.yaml').write_text(yaml.safe_dump(common))
+        for step, flag in (('disgen', '--geoFile'), ('disfilter', '--geoFile'),
+                           ('disreplay_gen', '--geofile'), ('disreplay_filter', '--geofile')):
+            settings = self.settings(step)
+            self.assertEqual(settings['geometry_file'], geometry)
+            self.assertEqual(settings['options'][flag], geometry)
+            self.assertIn(geometry, planning.executable_options(settings))
+        self.assertEqual(self.settings('replayfilter')['geometry_file'], geometry)
+        self.assertEqual(self.settings('analysis')['analysis']['geometry_file'], geometry)
+        self.assertEqual(self.settings('merger')['geometry_file'], geometry)
+        override = self.settings('analysis', geometry_file='other.root')
+        self.assertEqual(override['analysis']['geometry_file'], str(self.base / 'other.root'))
+        with self.assertRaisesRegex(ValueError, 'Use geometry_file'):
+            self.settings(options={'--geoFile': geometry})
+
+    def test_existing_analysis_can_be_inspected_after_shared_geometry_is_added(self):
+        old = self.settings('analysis')
+        state.State(old).save()
+        common = dict(self.common, geometry_file=str(self.base / 'shared.root'))
+        (self.base / 'workflow.yaml').write_text(yaml.safe_dump(common))
+        updated = self.settings('analysis')
+        state.State(updated, inspect_existing=True)
+        with self.assertRaisesRegex(ValueError, 'Settings differ'):
+            state.State(updated)
+
     def test_parallel_campaign_stages_share_their_own_namespace(self):
         folder = ROOT / 'prodWorkflow'
         for test in (False, True):
@@ -1143,7 +1171,7 @@ except SystemExit as error:
         saved.data['replayfilter_merge'] = dict(plan=plan, phase='published', local=str(self.base / 'local/baseline'))
         saved.save()
         with patch.object(workflow, 'upstream', side_effect=AssertionError('Must use saved plan')), \
-                patch.object(replayMerge, 'bundle_manifest') as validate, \
+                patch.object(replayMerge, 'published_manifest') as validate, \
                 patch.object(replayMerge, 'execute') as execute, \
                 patch.object(checking.checkAnalysis, 'merge_analysis') as analysis, \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -1155,6 +1183,30 @@ except SystemExit as error:
             self.assertEqual(execute.call_args.args[1], replayMerge.plan_diagnostics(plan))
             self.assertEqual(execute.call_args.args[2], self.base / 'local/replayfilter_diagnostics')
             analysis.assert_not_called()
+
+    def test_split_diagnostics_publish_in_order_and_release_each_part(self):
+        from prodWorkflow import replayMerge
+        saved = state.State(self.settings('merger', merge_replayfilter=True, defer_diagnostics=True))
+        inputs = [dict(path=f'/input/{i}.root', files=[dict(path=f'/input/{i}.root', size=3 * 1024 ** 3)],
+                       entry_start=i * 2, entry_stop=(i + 1) * 2) for i in range(3)]
+        plan = dict(id='baseline', diagnostics=True, defer_diagnostics=True, inputs=inputs,
+                    destination=str(self.base / 'published/merged'))
+        saved.data['replayfilter_merge'] = dict(plan=plan, phase='published', local=str(self.base / 'local/baseline'))
+        saved.save()
+        command = ['merge-diagnostics', saved.settings['config_file'], '--split']
+        with patch.object(workflow, 'upstream', side_effect=AssertionError('Must use saved plan')), \
+                patch.object(replayMerge, 'published_manifest'), patch.object(replayMerge, 'execute') as execute, \
+                contextlib.redirect_stdout(io.StringIO()):
+            workflow.main(command)
+            execute.assert_not_called()
+            workflow.main([*command, '--submit'])
+            self.assertEqual(len(execute.call_args_list), 4)
+            self.assertEqual([call.args[1] for call in execute.call_args_list],
+                             replayMerge.plan_diagnostic_parts(plan))
+            self.assertTrue(all(call.kwargs['release_local'] for call in execute.call_args_list))
+            self.assertEqual(state.State(saved.settings).data['replayfilter_diagnostics_parts']['phase'], 'published')
+            with self.assertRaisesRegex(ValueError, 'keep the original'):
+                workflow.main([*command, '--tree-part-gib', '8', '--submit'])
 
     def test_tree_only_archive_accepts_zero_events_without_histograms(self):
         record = self.analysis_archive(tree_only=True, entries=0)

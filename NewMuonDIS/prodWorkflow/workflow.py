@@ -46,6 +46,11 @@ def parser():
         if action in ('plan', 'merge'):
             command.add_argument('--writeToEOS', action='store_true',
                                  help='For merger YAML only: use output_base (EOS) instead of local results; explicit YAML paths override this')
+        if action == 'merge-diagnostics':
+            command.add_argument('--split', action='store_true',
+                                 help='Publish histograms and smaller tree parts separately; release each local part after publication')
+            command.add_argument('--tree-part-gib', type=int, default=4,
+                                 help='With --split: maximum combined input ROOT GiB per tree part (default: 4; output size can differ)')
         if action == 'check':
             command.add_argument('--metadata', action='store_true', help='Also print deduplicated preparation normalization totals')
             command.add_argument('--check-root', action='store_true', help='Read disgen statistics or replay/analysis scalar path lengths in addition to headers')
@@ -139,11 +144,32 @@ def merge(state, execute=False, write_to_eos=False):
     return 0
 
 
-def merge_diagnostics(state, execute=False):
+def merge_diagnostics(state, execute=False, split=False, tree_part_gib=4):
     from prodWorkflow import replayMerge
     baseline = state.data.get('replayfilter_merge')
     if not baseline or baseline['phase'] != 'published':
         raise ValueError('Complete the baseline replayfilter merge before merging deferred diagnostics')
+    if split:
+        plans = replayMerge.plan_diagnostic_parts(baseline['plan'], tree_part_gib * 1024 ** 3)
+        local = Path(baseline['local']).with_name('replayfilter_diagnostics_parts')
+        print(f'Split diagnostics: histograms then {len(plans) - 1} tree parts, at most {tree_part_gib} input GiB each')
+        print(f'Build each part under {local}; publish under {baseline["plan"]["destination"]}_diagnostics/')
+        print('Release each local part only after verified publication; published parts are reused on retry.')
+        saved = state.data.get('replayfilter_diagnostics_parts')
+        identities = [plan['id'] for plan in plans]
+        if saved and saved['plans'] != identities:
+            raise ValueError('Split diagnostic plan changed; keep the original --tree-part-gib')
+        if not execute:
+            print('Preview only; add --submit to merge split diagnostics.')
+            return 0
+        replayMerge.published_manifest(baseline['plan']['destination'], baseline['plan'])
+        state.data['replayfilter_diagnostics_parts'] = dict(plans=identities, phase='building')
+        state.save()
+        for plan in plans:
+            replayMerge.execute(state, plan, local / plan['diagnostic_part'], release_local=True)
+        state.data['replayfilter_diagnostics_parts']['phase'] = 'published'
+        state.save()
+        return 0
     plan = replayMerge.plan_diagnostics(baseline['plan'])
     local = Path(baseline['local']).with_name('replayfilter_diagnostics')
     print(f'Merge deferred diagnostics for {len(plan["inputs"])} inputs into {local}')
@@ -152,7 +178,7 @@ def merge_diagnostics(state, execute=False):
         print('Preview only; add --submit to merge diagnostics locally in FairShip.')
         return 0
     # Use the completed baseline plan, even if upstream checker exports have changed.
-    replayMerge.bundle_manifest(baseline['plan']['destination'], baseline['plan'])
+    replayMerge.published_manifest(baseline['plan']['destination'], baseline['plan'])
     replayMerge.execute(state, plan, local)
     return 0
 
@@ -209,7 +235,10 @@ def main(argv=None, api=None):
             if state.data.get('replayfilter_merge'):
                 merged = state.data['replayfilter_merge']
                 print(f'Replayfilter merge: {merged["phase"]}; destination: {merged["plan"]["destination"]}')
-            if state.data.get('replayfilter_diagnostics'):
+            if state.data.get('replayfilter_diagnostics_parts'):
+                parts = state.data['replayfilter_diagnostics_parts']
+                print(f'Split replayfilter diagnostics: {parts["phase"]}; {len(parts["plans"])} parts')
+            elif state.data.get('replayfilter_diagnostics'):
                 merged = state.data['replayfilter_diagnostics']
                 print(f'Replayfilter diagnostics: {merged["phase"]}; destination: {merged["plan"]["destination"]}')
             if api is None:
@@ -223,7 +252,7 @@ def main(argv=None, api=None):
         if args.action == 'merge':
             return merge(state, args.submit, write_to_eos=args.writeToEOS)
         if args.action == 'merge-diagnostics':
-            return merge_diagnostics(state, args.submit)
+            return merge_diagnostics(state, args.submit, split=args.split, tree_part_gib=args.tree_part_gib)
         if args.submit and api is None:
             cli.error('Submission requires ./gangaSubmit.sh FILE.yaml --submit (or retry FILE.yaml --submit)')
         if args.action == 'retry':

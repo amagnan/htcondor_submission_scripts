@@ -6,7 +6,7 @@ events_per_file: 250000        # Required for disgen; maximum input entries per 
 events_per_subjob: 25000      # Example: ten subjobs per full file; default null.
 n_jobs: 100                   # Maximum new Ganga masters per invocation; -1 = all.
 options:
-  --geoFile: /eos/experiment/ship/simulation/cuda_muons/try_2026_v2_50cm_before_end_MS/geo_38e81e44-f930-4da3-8c80-dfa3b693a616.root
+  # --materials: [MS, UBT, SBTsens, SBTfr, SSTsens, SSTfr, HE, AIR, HeBalloon, SBTss]  # Default: all except REST.
   --nDIS: 100                 # Workflow default 100 (executable default 1000).
   --z_min: 2000               # Workflow default 2000 cm (executable default 2500).
   --z_max: 9500               # Workflow default 9500 cm (executable default 20000).
@@ -37,4 +37,3 @@ workflow: workflow_26.yaml       # Relative to this file.
 # output_base: /eos/experiment/ship/user/ammagnan/MuonDIS
 # tag: TRY2026
 # production: new_production
-
