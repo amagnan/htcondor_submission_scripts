@@ -31,7 +31,8 @@ EXECUTABLES = {'disgen': 'newMuonDIS/prepareEvents.py',
                'disreplay_filter': 'macro/run_simScript.py',
                'analysis': 'newMuonDIS/analyseEvents.py'}
 OPTIONS = {
-    'disgen': {'--nDIS': 100, '--z_min': 2000, '--z_max': 9500, '--debug': 0},
+    'disgen': {'--nDIS': 100, '--z_min': 2000, '--z_max': 9500, '--debug': 0,
+               '--require-sbt-hit': False},
     'disfilter': {'--filter-option': 1, '--pythia-decays': True},
     'disreplay_gen': {'--NewMuDIS': True, '--shieldName': 'TRY_2026',
                       '--field_map': 'files/2026_07_02_MainSpectrometerField_V21_2455.root',
@@ -184,6 +185,10 @@ def signature(settings):
     if settings.get('masters_per_job', 1) == 1:
         excluded.add('masters_per_job')
     result = {key: value for key, value in settings.items() if key not in excluded}
+    if settings['step'] == 'disgen' and result['options'].get('--require-sbt-hit') is False:
+        # The disabled default preserves signatures saved before this option existed.
+        result['options'] = dict(result['options'])
+        result['options'].pop('--require-sbt-hit')
     if settings['step'] != 'replayfilter':
         # Other stages record the effective geometry in options or analysis;
         # merger only consumes geometries already checked in upstream files.

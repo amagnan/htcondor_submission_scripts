@@ -64,6 +64,12 @@ the settings most likely to change. `options` accepts the corresponding
 FairShip executable's physics flags; `null`/`false` suppress a flag, while a list
 provides multiple arguments. Input, output and range flags are reserved.
 
+Set `options.--require-sbt-hit: true` near the top of `disgen.yaml` (or
+`disgen_26.yaml`) to select only input muons with at least one SBT hit belonging
+to the selected primary muon. The default is `false`; enabling it passes
+`--require-sbt-hit` to `prepareEvents.py`. Use a new stage name or production
+when changing this selection after planning jobs.
+
 Select DIS categories with `options.--materials`, using a YAML list such as
 `--materials: [HE, HeBalloon]`. Uncomment and edit the examples in the `disgen`
 and `disreplay_gen`/`disreplay_filter` YAMLs to choose a subset. Valid categories

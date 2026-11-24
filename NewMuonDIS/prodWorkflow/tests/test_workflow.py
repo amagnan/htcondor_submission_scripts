@@ -148,6 +148,27 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotEqual(normal['step_dir'], test['step_dir'])
             self.assertNotEqual(normal['output_dir'], test['output_dir'])
 
+    def test_disgen_sbt_selection_reaches_tasks_and_preserves_disabled_state(self):
+        flag = '--require-sbt-hit'
+        default = self.settings()
+        self.assertIs(default['options'][flag], False)
+        legacy = deepcopy(default)
+        legacy['options'].pop(flag)
+        state.State(legacy).save()
+        for options in ({}, {flag: False}):
+            settings = self.settings(options=options)
+            state.State(settings)
+            for group in planning.plan(settings):
+                for unit in group['units']:
+                    self.assertNotIn(flag, unit['spec']['args'])
+        enabled = self.settings(options={flag: True})
+        for group in planning.plan(enabled):
+            for unit in group['units']:
+                self.assertEqual(unit['spec']['args'].count(flag), 1)
+                self.assertNotIn('True', unit['spec']['args'])
+        with self.assertRaisesRegex(ValueError, 'Settings differ'):
+            state.State(enabled)
+
     def test_shared_geometry_reaches_each_stage(self):
         geometry = str(self.base / 'shared.root')
         common = dict(self.common, geometry_file=geometry)
